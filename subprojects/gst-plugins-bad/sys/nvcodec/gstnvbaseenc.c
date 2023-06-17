@@ -2404,9 +2404,12 @@ _submit_input_buffer (GstNvBaseEnc * nvenc, GstVideoCodecFrame * frame,
   return GST_FLOW_OK;
 }
 
+static int frame_count = 0;//tm
 static GstFlowReturn
 gst_nv_base_enc_handle_frame (GstVideoEncoder * enc, GstVideoCodecFrame * frame)
 {
+  frame_count++;//tm
+  GST_INFO("encoding frame, frame count: %d",frame_count);//tm
   GstNvBaseEnc *nvenc = GST_NV_BASE_ENC (enc);
   NVENCSTATUS nv_ret;
   GstVideoFrame vframe;

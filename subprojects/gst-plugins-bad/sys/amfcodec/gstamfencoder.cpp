@@ -307,7 +307,7 @@ gst_amf_encoder_process_output (GstAmfEncoder * self, AMFBuffer * buffer)
     frame->output_buffer = output_buffer;
 
     if (sync_point) {
-      GST_WARNING ("keyframe detected");
+      GST_WARNING ("keyframe detected"); //tm
       GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
     }
   } else {
@@ -838,10 +838,13 @@ gst_amf_encoder_submit_input (GstAmfEncoder * self, AMFSurface * surface)
   return ret;
 }
 
+static int frame_count = 0;//tm
 static GstFlowReturn
 gst_amf_encoder_handle_frame (GstVideoEncoder * encoder,
     GstVideoCodecFrame * frame)
 {
+  frame_count++;//tm
+  GST_INFO("encoding frame, frame count: %d",frame_count);//tm
   GstAmfEncoder *self = GST_AMF_ENCODER (encoder);
   GstAmfEncoderClass *klass = GST_AMF_ENCODER_GET_CLASS (self);
   GstAmfEncoderPrivate *priv = self->priv;

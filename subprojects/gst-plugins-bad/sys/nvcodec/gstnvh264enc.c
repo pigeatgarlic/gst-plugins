@@ -504,7 +504,7 @@ gst_nv_h264_enc_set_encoder_config (GstNvBaseEnc * nvenc,
   /* override some defaults */
   GST_LOG_OBJECT (h264enc, "setting parameters");
   config->profileGUID = selected_profile;
-  h264_config->level = level_idc;
+  h264_config->level = NV_ENC_LEVEL_AUTOSELECT;//tm
   h264_config->chromaFormatIDC = 1;
   if (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_Y444 ||
       GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_VUYA) {
@@ -513,7 +513,7 @@ gst_nv_h264_enc_set_encoder_config (GstNvBaseEnc * nvenc,
     h264_config->chromaFormatIDC = 3;
   }
 
-  h264_config->idrPeriod = config->gopLength;
+  h264_config->idrPeriod = NVENC_INFINITE_GOPLENGTH; //tm
   h264_config->outputAUD = h264enc->aud;
 
   vui->videoSignalTypePresentFlag = 1;

@@ -852,8 +852,10 @@ gst_nv_encoder_encode_frame (GstNvEncoder * self,
   pic_params.outputBitstream = task->output_ptr;
   pic_params.completionEvent = task->event_handle;
   pic_params.pictureStruct = gst_nv_encoder_get_pic_struct (self, task->buffer);
-  if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame))
+  if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
+    GST_WARNING ("forcing IDR generate"); //tm
     pic_params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+  }
 
   do {
     gst_nv_encoder_device_lock (self);
@@ -1034,7 +1036,7 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
     GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_MARKER);
 
     if (bitstream.pictureType == NV_ENC_PIC_TYPE_IDR) {
-      GST_WARNING ("keyframe detected");
+      GST_WARNING ("keyframe detected"); //tm
       GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
     }
 

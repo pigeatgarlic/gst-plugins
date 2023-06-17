@@ -1209,107 +1209,17 @@ gst_nv_h264_encoder_set_format (GstNvEncoder * encoder,
   }
 
   *config = preset_config.presetCfg;
-  if (self->gop_size < 0) {
-    config->gopLength = NVENC_INFINITE_GOPLENGTH;
-    config->frameIntervalP = 1;
-  } else if (self->gop_size > 0) {
-    config->gopLength = self->gop_size;
-    /* frameIntervalP
-     * 0: All Intra frames
-     * 1: I/P only
-     * 2: IBP
-     * 3: IBBP
-     */
-    config->frameIntervalP = 1;
-    if (self->bframes > 0 && !downstream_supports_bframe) {
-      GST_WARNING_OBJECT (self,
-          "B-frame was enabled but downstream profile does not support it");
-      bframe_aborted = TRUE;
-      self->bframes = 0;
-    }
-
-    config->frameIntervalP = self->bframes + 1;
-  } else {
-    /* gop size == 0 means all intra frames */
-    config->gopLength = 1;
-    config->frameIntervalP = 0;
-  }
-
+  config->gopLength = NVENC_INFINITE_GOPLENGTH; //tm
+  config->frameIntervalP = 1; //tm
   rc_params = &config->rcParams;
-  rc_mode = self->rc_mode;
-
+  rc_params->rateControlMode = NV_ENC_PARAMS_RC_CBR_LOWDELAY_HQ; //tm
+  rc_params->strictGOPTarget = 1; //tm
+  rc_params->enableNonRefP = self->non_ref_p; //tm
+  rc_params->zeroReorderDelay = 1; //tm
+  rc_params->enableTemporalAQ = 0;
   if (self->bitrate)
-    rc_params->averageBitRate = self->bitrate * 1024;
-  if (self->max_bitrate)
-    rc_params->maxBitRate = self->max_bitrate * 1024;
-  if (self->vbv_buffer_size)
-    rc_params->vbvBufferSize = self->vbv_buffer_size * 1024;
+    rc_params->averageBitRate = self->bitrate * 1024; //tm
 
-  if (self->min_qp_i >= 0) {
-    rc_params->enableMinQP = TRUE;
-    rc_params->minQP.qpIntra = self->min_qp_i;
-    if (self->min_qp_p >= 0) {
-      rc_params->minQP.qpInterP = self->min_qp_p;
-    } else {
-      rc_params->minQP.qpInterP = rc_params->minQP.qpIntra;
-    }
-    if (self->min_qp_b >= 0) {
-      rc_params->minQP.qpInterB = self->min_qp_b;
-    } else {
-      rc_params->minQP.qpInterB = rc_params->minQP.qpInterP;
-    }
-  }
-
-  if (self->max_qp_i >= 0) {
-    rc_params->enableMaxQP = TRUE;
-    rc_params->maxQP.qpIntra = self->max_qp_i;
-    if (self->max_qp_p >= 0) {
-      rc_params->maxQP.qpInterP = self->max_qp_p;
-    } else {
-      rc_params->maxQP.qpInterP = rc_params->maxQP.qpIntra;
-    }
-    if (self->max_qp_b >= 0) {
-      rc_params->maxQP.qpInterB = self->max_qp_b;
-    } else {
-      rc_params->maxQP.qpInterB = rc_params->maxQP.qpInterP;
-    }
-  }
-
-  if (rc_mode == GST_NV_ENCODER_RC_MODE_CONSTQP) {
-    if (self->qp_i >= 0)
-      rc_params->constQP.qpIntra = self->qp_i;
-    if (self->qp_p >= 0)
-      rc_params->constQP.qpInterP = self->qp_p;
-    if (self->qp_b >= 0)
-      rc_params->constQP.qpInterB = self->qp_b;
-  }
-
-  rc_params->rateControlMode = gst_nv_encoder_rc_mode_to_native (rc_mode);
-
-  if (self->spatial_aq) {
-    rc_params->enableAQ = TRUE;
-    rc_params->aqStrength = self->aq_strength;
-  }
-
-  rc_params->enableTemporalAQ = self->temporal_aq;
-
-  if (self->rc_lookahead) {
-    rc_params->enableLookahead = 1;
-    rc_params->lookaheadDepth = self->rc_lookahead;
-    rc_params->disableIadapt = !self->i_adapt;
-    rc_params->disableBadapt = !self->b_adapt;
-  }
-
-  rc_params->strictGOPTarget = self->strict_gop;
-  rc_params->enableNonRefP = self->non_ref_p;
-  rc_params->zeroReorderDelay = self->zero_reorder_delay;
-
-  if (self->const_quality) {
-    guint scaled = (gint) (self->const_quality * 256.0);
-
-    rc_params->targetQuality = (guint8) (scaled >> 8);
-    rc_params->targetQualityLSB = (guint8) (scaled & 0xff);
-  }
   self->init_param_updated = FALSE;
   self->bitrate_updated = FALSE;
   self->rc_param_updated = FALSE;

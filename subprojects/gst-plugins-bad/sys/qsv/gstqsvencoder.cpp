@@ -751,10 +751,13 @@ gst_qsv_encoder_find_output_frame (GstQsvEncoder * self, GstClockTime pts)
   return ret;
 }
 
+static int encoded_frame_count = 0;//tm
 static GstFlowReturn
 gst_qsv_encoder_finish_frame (GstQsvEncoder * self, GstQsvEncoderTask * task,
     gboolean discard)
 {
+  encoded_frame_count++;//tm
+  GST_INFO("encoded frame, frame count: %d",encoded_frame_count);//tm
   GstQsvEncoderPrivate *priv = self->priv;
   GstQsvEncoderClass *klass = GST_QSV_ENCODER_GET_CLASS (self);
   mfxStatus status;
@@ -821,7 +824,7 @@ gst_qsv_encoder_finish_frame (GstQsvEncoder * self, GstQsvEncoderTask * task,
     qsv_dts = gst_qsv_timestamp_to_gst ((mfxU64) bs->DecodeTimeStamp);
 
   if ((bs->FrameType & MFX_FRAMETYPE_IDR) != 0) {
-    GST_WARNING( "keyframe detected");
+    GST_WARNING( "keyframe detected"); //tm
     keyframe = TRUE;
   }
 
@@ -1285,10 +1288,13 @@ gst_qsv_encoder_get_pic_struct (GstQsvEncoder * self,
   return MFX_PICSTRUCT_FIELD_BFF;
 }
 
+static int frame_count = 0;//tm
 static GstFlowReturn
 gst_qsv_encoder_handle_frame (GstVideoEncoder * encoder,
     GstVideoCodecFrame * frame)
 {
+  frame_count++;//tm
+  GST_INFO("encoding frame, frame count: %d",frame_count);//tm
   GstQsvEncoder *self = GST_QSV_ENCODER (encoder);
   GstQsvEncoderPrivate *priv = self->priv;
   GstQsvEncoderClass *klass = GST_QSV_ENCODER_GET_CLASS (self);
@@ -1357,7 +1363,7 @@ gst_qsv_encoder_handle_frame (GstVideoEncoder * encoder,
       gst_qsv_encoder_get_pic_struct (self, frame);
 
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
-    GST_WARNING ("forcing IDR generate");
+    GST_WARNING ("forcing IDR generate"); //tm
     surface->encode_control.FrameType =
         MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF;
   } else {

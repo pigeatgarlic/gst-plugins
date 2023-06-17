@@ -1216,7 +1216,7 @@ gst_amf_h264_enc_set_surface_prop (GstAmfEncoder * encoder,
   amf_bool insert_aud = self->aud ? true : false;
 
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
-    GST_WARNING ("forcing IDR generate");
+    GST_WARNING ("forcing IDR generate"); //tm
     amf_int64 type = (amf_int64) AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR;
     result = surf->SetProperty (AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, type);
     if (result != AMF_OK) {

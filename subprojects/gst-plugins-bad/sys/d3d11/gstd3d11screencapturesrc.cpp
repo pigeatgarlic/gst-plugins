@@ -1144,7 +1144,7 @@ gst_d3d11_screen_capture_src_create (GstBaseSrc * bsrc, guint64 offset,
     guint size, GstBuffer ** buf)
 {
   frame_count++;
-  GST_WARNING("capturing frame, frame count: %d");
+  GST_INFO("capturing frame, frame count: %d",frame_count);//tm
   GstD3D11ScreenCaptureSrc *self = GST_D3D11_SCREEN_CAPTURE_SRC (bsrc);
   ID3D11Texture2D *texture;
   ID3D11RenderTargetView *rtv = NULL;
