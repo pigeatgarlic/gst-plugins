@@ -1357,6 +1357,7 @@ gst_qsv_encoder_handle_frame (GstVideoEncoder * encoder,
       gst_qsv_encoder_get_pic_struct (self, frame);
 
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
+    GST_WARNING ("forcing IDR generate");
     surface->encode_control.FrameType =
         MFX_FRAMETYPE_IDR | MFX_FRAMETYPE_I | MFX_FRAMETYPE_REF;
   } else {

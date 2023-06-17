@@ -1374,11 +1374,11 @@ gst_qsv_h264_enc_set_format (GstQsvEncoder * encoder,
   g_mutex_lock (&self->prop_lock);
   param->mfx.CodecId = MFX_CODEC_AVC;
   param->mfx.CodecProfile = mfx_profile;
-  param->mfx.GopRefDist = bframes + 1;
-  param->mfx.GopPicSize = self->gop_size;
-  param->mfx.IdrInterval = self->idr_interval;
-  param->mfx.RateControlMethod = self->rate_control;
-  param->mfx.NumRefFrame = self->ref_frames;
+  param->mfx.GopRefDist = 1;
+  param->mfx.GopPicSize = 60 * 60 * 60; //gen ref frame every one hour //tm
+  param->mfx.IdrInterval = 0; //tm
+  param->mfx.RateControlMethod = MFX_RATECONTROL_CBR; //tm
+  param->mfx.NumRefFrame = 0;
 
   gst_qsv_h264_enc_set_bitrate (self, param);
 

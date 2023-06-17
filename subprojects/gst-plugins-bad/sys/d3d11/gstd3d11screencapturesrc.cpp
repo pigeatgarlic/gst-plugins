@@ -1138,10 +1138,13 @@ gst_d3d11_screen_capture_src_src_query (GstBaseSrc * bsrc, GstQuery * query)
   return GST_BASE_SRC_CLASS (parent_class)->query (bsrc, query);
 }
 
+static int frame_count = 0;
 static GstFlowReturn
 gst_d3d11_screen_capture_src_create (GstBaseSrc * bsrc, guint64 offset,
     guint size, GstBuffer ** buf)
 {
+  frame_count++;
+  GST_WARNING("capturing frame, frame count: %d");
   GstD3D11ScreenCaptureSrc *self = GST_D3D11_SCREEN_CAPTURE_SRC (bsrc);
   ID3D11Texture2D *texture;
   ID3D11RenderTargetView *rtv = NULL;
