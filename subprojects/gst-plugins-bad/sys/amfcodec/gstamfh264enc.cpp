@@ -927,6 +927,12 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
     }
   }
 
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_IDR_PERIOD, 0);
+  GST_WARNING ("Set IDR period to 0");
+  if (result != AMF_OK) {
+    GST_ERROR ("Failed to set IDR period");
+    goto error;
+  }  
   result = comp->Init (AMF_SURFACE_NV12, info->width, info->height);
   if (result != AMF_OK) {
     GST_ERROR_OBJECT (self, "Failed to init component, result %"
@@ -998,15 +1004,6 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
     goto error;
   }
 
-  if (self->gop_size >= 0) {
-    result = comp->SetProperty (AMF_VIDEO_ENCODER_IDR_PERIOD,
-        (amf_int64) self->gop_size);
-    if (result != AMF_OK) {
-      GST_ERROR_OBJECT (self, "Failed to set IDR period, result %"
-          GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
-      goto error;
-    }
-  }
 
   if (profile != AMF_VIDEO_ENCODER_PROFILE_BASELINE &&
       profile != AMF_VIDEO_ENCODER_PROFILE_CONSTRAINED_BASELINE) {
@@ -1219,6 +1216,7 @@ gst_amf_h264_enc_set_surface_prop (GstAmfEncoder * encoder,
   amf_bool insert_aud = self->aud ? true : false;
 
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame)) {
+    GST_WARNING ("forcing IDR generate");
     amf_int64 type = (amf_int64) AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR;
     result = surf->SetProperty (AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE, type);
     if (result != AMF_OK) {

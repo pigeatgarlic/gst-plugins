@@ -306,8 +306,10 @@ gst_amf_encoder_process_output (GstAmfEncoder * self, AMFBuffer * buffer)
   if (frame) {
     frame->output_buffer = output_buffer;
 
-    if (sync_point)
+    if (sync_point) {
+      GST_WARNING ("keyframe detected");
       GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
+    }
   } else {
     if (!sync_point)
       GST_BUFFER_FLAG_SET (output_buffer, GST_BUFFER_FLAG_DELTA_UNIT);
