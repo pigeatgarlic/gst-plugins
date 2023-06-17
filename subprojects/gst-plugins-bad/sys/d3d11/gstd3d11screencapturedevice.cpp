@@ -129,7 +129,7 @@ gst_d3d11_screen_capture_device_create_element (GstDevice * device,
   GstD3D11ScreenCaptureDevice *self = GST_D3D11_SCREEN_CAPTURE_DEVICE (device);
   GstElement *elem;
 
-  elem = gst_element_factory_make ("d3d11screencapturesrc", name);
+  elem = gst_element_factory_make ("tmd3d11screencapturesrc", name);
 
   g_object_set (elem, "monitor-handle", self->monitor_handle, nullptr);
 

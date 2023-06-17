@@ -1613,7 +1613,7 @@ gst_qsv_h264_enc_set_output_state (GstQsvEncoder * encoder,
   gst_video_codec_state_unref (out_state);
 
   tags = gst_tag_list_new_empty ();
-  gst_tag_list_add (tags, GST_TAG_MERGE_REPLACE, GST_TAG_ENCODER, "qsvh264enc",
+  gst_tag_list_add (tags, GST_TAG_MERGE_REPLACE, GST_TAG_ENCODER, "tmqsvh264enc",
       nullptr);
 
   if (param.mfx.BRCParamMultiplier > 0)
@@ -1854,7 +1854,7 @@ gst_qsv_h264_enc_register (GstPlugin * plugin, guint rank, guint impl_index,
   bool supports_interlaced = false;
 
   GST_DEBUG_CATEGORY_INIT (gst_qsv_h264_enc_debug,
-      "qsvh264enc", 0, "qsvh264enc");
+      "tmqsvh264enc", 0, "tmqsvh264enc");
 
   memset (&param, 0, sizeof (mfxVideoParam));
   memset (&max_resolution, 0, sizeof (GstQsvResolution));
@@ -2038,7 +2038,7 @@ gst_qsv_h264_enc_register (GstPlugin * plugin, guint rank, guint impl_index,
   };
 
   type_name = g_strdup ("GstQsvH264Enc");
-  feature_name = g_strdup ("qsvh264enc");
+  feature_name = g_strdup ("tmqsvh264enc");
 
   gint index = 0;
   while (g_type_from_name (type_name)) {

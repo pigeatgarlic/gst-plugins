@@ -104,8 +104,8 @@ struct _GstD3D11BaseConvert
 #define gst_d3d11_base_convert_parent_class parent_class
 G_DEFINE_ABSTRACT_TYPE_WITH_CODE (GstD3D11BaseConvert, gst_d3d11_base_convert,
     GST_TYPE_D3D11_BASE_FILTER,
-    GST_DEBUG_CATEGORY_INIT (gst_d3d11_convert_debug, "d3d11convert", 0,
-        "d3d11convert"));
+    GST_DEBUG_CATEGORY_INIT (gst_d3d11_convert_debug, "tmd3d11convert", 0,
+        "tmd3d11convert"));
 
 static void gst_d3d11_base_convert_dispose (GObject * object);
 static GstCaps *gst_d3d11_base_convert_transform_caps (GstBaseTransform *

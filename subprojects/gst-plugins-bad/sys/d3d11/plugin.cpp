@@ -222,7 +222,7 @@ plugin_init (GstPlugin * plugin)
   gst_element_register (plugin,
       "d3d11download", GST_RANK_NONE, GST_TYPE_D3D11_DOWNLOAD);
   gst_element_register (plugin,
-      "d3d11convert", GST_RANK_NONE, GST_TYPE_D3D11_CONVERT);
+      "tmd3d11convert", GST_RANK_NONE, GST_TYPE_D3D11_CONVERT);
   gst_element_register (plugin,
       "d3d11colorconvert", GST_RANK_NONE, GST_TYPE_D3D11_COLOR_CONVERT);
   gst_element_register (plugin,
@@ -238,12 +238,12 @@ plugin_init (GstPlugin * plugin)
 #if !GST_D3D11_WINAPI_ONLY_APP
   if (gst_d3d11_is_windows_8_or_greater ()) {
     GST_DEBUG_CATEGORY_INIT (gst_d3d11_screen_capture_debug,
-        "d3d11screencapturesrc", 0, "d3d11screencapturesrc");
+        "tmd3d11screencapturesrc", 0, "tmd3d11screencapturesrc");
     GST_DEBUG_CATEGORY_INIT (gst_d3d11_screen_capture_device_debug,
         "d3d11screencapturedevice", 0, "d3d11screencapturedevice");
 
     gst_element_register (plugin,
-        "d3d11screencapturesrc", GST_RANK_NONE,
+        "tmd3d11screencapturesrc", GST_RANK_NONE,
         GST_TYPE_D3D11_SCREEN_CAPTURE_SRC);
     gst_device_provider_register (plugin,
         "d3d11screencapturedeviceprovider", GST_RANK_PRIMARY,

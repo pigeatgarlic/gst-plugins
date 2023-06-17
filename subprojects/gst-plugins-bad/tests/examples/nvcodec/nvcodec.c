@@ -360,7 +360,7 @@ main (gint argc, gchar ** argv)
   gst_init (NULL, NULL);
 
   if (!encoder_name)
-    encoder_name = g_strdup ("nvh264enc");
+    encoder_name = g_strdup ("tmnvh264enc");
 
   if (!check_nvcodec_available (encoder_name)) {
     g_printerr ("Cannot load nvcodec plugin");

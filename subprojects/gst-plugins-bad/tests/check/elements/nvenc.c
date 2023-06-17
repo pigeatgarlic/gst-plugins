@@ -47,7 +47,7 @@ setup_nvenc (const gchar * src_caps_str, GstCaps ** srccaps)
   caps = gst_caps_from_string (src_caps_str);
   fail_unless (caps != NULL);
 
-  nvenc = gst_check_setup_element ("nvh264enc");
+  nvenc = gst_check_setup_element ("tmnvh264enc");
   fail_unless (nvenc != NULL);
   srcpad = gst_check_setup_src_pad (nvenc, &srctemplate);
   sinkpad = gst_check_setup_sink_pad (nvenc, &sinktemplate);
@@ -394,7 +394,7 @@ check_nvenc_available (void)
   gboolean ret = TRUE;
   GstElement *nvenc;
 
-  nvenc = gst_element_factory_make ("nvh264enc", NULL);
+  nvenc = gst_element_factory_make ("tmnvh264enc", NULL);
   if (!nvenc) {
     GST_WARNING ("nvh264enc is not available, possibly driver load failure");
     return FALSE;

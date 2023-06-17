@@ -1033,8 +1033,10 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
 
     GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_MARKER);
 
-    if (bitstream.pictureType == NV_ENC_PIC_TYPE_IDR)
+    if (bitstream.pictureType == NV_ENC_PIC_TYPE_IDR) {
+      GST_WARNING ("keyframe detected");
       GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
+    }
 
     NvEncUnlockBitstream (priv->session, task->output_ptr);
     gst_nv_encoder_device_unlock (self);

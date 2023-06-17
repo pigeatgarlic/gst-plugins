@@ -423,11 +423,11 @@ main (gint argc, gchar ** argv)
   gst_init (NULL, NULL);
 
   if (!encoder_name)
-    encoder_name = g_strdup ("qsvh264enc");
+    encoder_name = g_strdup ("tmqsvh264enc");
   if (!rate_control)
     rate_control = g_strdup ("cbr");
 
-  if (g_strcmp0 (encoder_name, "qsvh264enc") == 0) {
+  if (g_strcmp0 (encoder_name, "tmqsvh264enc") == 0) {
     codec = CODEC_AVC;
   } else if (g_strcmp0 (encoder_name, "qsvh265enc") == 0) {
     codec = CODEC_HEVC;

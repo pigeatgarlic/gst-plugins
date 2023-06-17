@@ -2065,7 +2065,7 @@ gst_nv_h264_encoder_register_d3d11 (GstPlugin * plugin, GstD3D11Device * device,
   };
 
   type_name = g_strdup ("GstNvD3D11H264Enc");
-  feature_name = g_strdup ("nvd3d11h264enc");
+  feature_name = g_strdup ("tmnvd3d11h264enc");
 
   gint index = 0;
   while (g_type_from_name (type_name)) {

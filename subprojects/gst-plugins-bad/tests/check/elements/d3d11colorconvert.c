@@ -343,7 +343,7 @@ GST_END_TEST;
 static Suite *
 d3d11convert_suite (void)
 {
-  Suite *s = suite_create ("d3d11convert");
+  Suite *s = suite_create ("tmd3d11convert");
   TCase *tc_basic = tcase_create ("general");
 
   run_visual_test = g_getenv ("ENABLE_D3D11_VISUAL_TEST");

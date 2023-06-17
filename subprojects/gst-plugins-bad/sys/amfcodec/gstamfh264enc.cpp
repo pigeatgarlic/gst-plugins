@@ -1200,7 +1200,7 @@ gst_amf_h264_enc_set_output_state (GstAmfEncoder * encoder,
 
   tags = gst_tag_list_new_empty ();
   gst_tag_list_add (tags, GST_TAG_MERGE_REPLACE, GST_TAG_ENCODER,
-      "amfh264enc", nullptr);
+      "tmamfh264enc", nullptr);
 
   gst_video_encoder_merge_tags (GST_VIDEO_ENCODER (encoder),
       tags, GST_TAG_MERGE_REPLACE);
@@ -1568,8 +1568,8 @@ gst_amf_h264_enc_register_d3d11 (GstPlugin * plugin, GstD3D11Device * device,
   AMFComponentPtr comp;
   AMF_RESULT result;
 
-  GST_DEBUG_CATEGORY_INIT (gst_amf_h264_enc_debug, "amfh264enc", 0,
-      "amfh264enc");
+  GST_DEBUG_CATEGORY_INIT (gst_amf_h264_enc_debug, "tmamfh264enc", 0,
+      "tmamfh264enc");
 
   result = factory->CreateComponent (amf_context, AMFVideoEncoderVCE_AVC,
       &comp);
@@ -1599,7 +1599,7 @@ gst_amf_h264_enc_register_d3d11 (GstPlugin * plugin, GstD3D11Device * device,
   };
 
   type_name = g_strdup ("GstAmfH264Enc");
-  feature_name = g_strdup ("amfh264enc");
+  feature_name = g_strdup ("tmamfh264enc");
 
   gint index = 0;
   while (g_type_from_name (type_name)) {

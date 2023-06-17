@@ -243,7 +243,7 @@ gst_nv_h264_enc_class_init (GstNvH264EncClass * klass, gpointer data)
   g_free (long_name);
 
   GST_DEBUG_CATEGORY_INIT (gst_nv_h264_enc_debug,
-      "nvh264enc", 0, "Nvidia H.264 encoder");
+      "tmnvh264enc", 0, "Nvidia H.264 encoder");
 
   pad_templ = gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
       cdata->sink_caps);
@@ -723,7 +723,7 @@ gst_nv_h264_enc_register (GstPlugin * plugin, guint device_id, guint rank,
   GST_MINI_OBJECT_FLAG_SET (src_caps, GST_MINI_OBJECT_FLAG_MAY_BE_LEAKED);
 
   type_name = g_strdup ("GstNvH264Enc");
-  feature_name = g_strdup ("nvh264enc");
+  feature_name = g_strdup ("tmnvh264enc");
 
   if (g_type_from_name (type_name) != 0) {
     g_free (type_name);

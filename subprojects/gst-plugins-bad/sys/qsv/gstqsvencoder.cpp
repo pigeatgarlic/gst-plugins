@@ -820,8 +820,10 @@ gst_qsv_encoder_finish_frame (GstQsvEncoder * self, GstQsvEncoderTask * task,
   if (klass->codec_id == MFX_CODEC_AVC || klass->codec_id == MFX_CODEC_HEVC)
     qsv_dts = gst_qsv_timestamp_to_gst ((mfxU64) bs->DecodeTimeStamp);
 
-  if ((bs->FrameType & MFX_FRAMETYPE_IDR) != 0)
+  if ((bs->FrameType & MFX_FRAMETYPE_IDR) != 0) {
+    GST_WARNING( "keyframe detected");
     keyframe = TRUE;
+  }
 
   if (klass->create_output_buffer) {
     buffer = klass->create_output_buffer (self, bs);
