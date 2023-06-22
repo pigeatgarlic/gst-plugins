@@ -800,9 +800,7 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
   AMF_RESULT result;
   AMFRate framerate;
   AMFRatio aspect_ratio;
-  amf_int64 int64_val;
   amf_bool boolean_val;
-  AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_ENUM rc_mode;
   AMF_VIDEO_ENCODER_CODING_ENUM cabac = AMF_VIDEO_ENCODER_UNDEFINED;
 
   self->packetized = FALSE;
@@ -865,16 +863,41 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
     goto error;
   }
 
-  result = comp->SetProperty (AMF_VIDEO_ENCODER_USAGE, (amf_int64) self->usage);
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_USAGE, 
+    AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY); //tm
   if (result != AMF_OK) {
     GST_ERROR_OBJECT (self, "Failed to set usage, result %"
         GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
     goto error;
   }
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_MAX_LTR_FRAMES, 0); //tm
+  if (result != AMF_OK) {
+    GST_ERROR_OBJECT (self, "Failed to disable LTR ref, result %"
+        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
+    goto error;
+  }
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_B_PIC_PATTERN, 0); //tm
+  if (result != AMF_OK) {
+    GST_ERROR_OBJECT (self, "Failed to disable b ref, result %"
+        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
+    goto error;
+  }
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_B_REFERENCE_ENABLE, FALSE); //tm
+  if (result != AMF_OK) {
+    GST_ERROR_OBJECT (self, "Failed to disable b ref, result %"
+        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
+    goto error;
+  }
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_LOWLATENCY_MODE, TRUE); //tm
+  if (result != AMF_OK) {
+    GST_ERROR_OBJECT (self, "Failed to set low latency mode, result %"
+        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
+    goto error;
+  }
 
   if (self->preset > AMF_VIDEO_ENCODER_QUALITY_PRESET_UNKNOWN) {
-    result = comp->SetProperty (AMF_VIDEO_ENCODER_QUALITY_PRESET,
-        (amf_int64) self->preset);
+    result = comp->SetProperty (AMF_VIDEO_ENCODER_QUALITY_PRESET, 
+      AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED); //tm
     if (result != AMF_OK) {
       GST_ERROR_OBJECT (self, "Failed to set quality preset, result %"
           GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
@@ -889,8 +912,7 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
     goto error;
   }
 
-  result = comp->SetProperty (AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES,
-      (amf_int64) self->ref_frames);
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 0);//tm
   if (result != AMF_OK) {
     GST_ERROR_OBJECT (self, "Failed to set ref-frames, result %"
         GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
@@ -917,17 +939,15 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
     goto error;
   }
 
-  if (self->rate_control != AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_UNKNOWN) {
-    result = comp->SetProperty (AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-        (amf_int64) self->rate_control);
-    if (result != AMF_OK) {
-      GST_ERROR_OBJECT (self, "Failed to set rate-control, result %"
-          GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
-      goto error;
-    }
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, 
+    AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);//tm
+  if (result != AMF_OK) {
+    GST_ERROR_OBJECT (self, "Failed to set rate-control, result %"
+        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
+    goto error;
   }
 
-  result = comp->SetProperty (AMF_VIDEO_ENCODER_IDR_PERIOD, 0);
+  result = comp->SetProperty (AMF_VIDEO_ENCODER_IDR_PERIOD, 0); //tm
   GST_WARNING ("Set IDR period to 0");
   if (result != AMF_OK) {
     GST_ERROR ("Failed to set IDR period");
@@ -941,45 +961,17 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
   }
 
   /* dynamic properties */
-  result = comp->GetProperty (AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-      &int64_val);
-  if (result != AMF_OK) {
-    GST_ERROR_OBJECT (self, "Failed to get rate-control method, result %"
-        GST_AMF_RESULT_FORMAT, GST_AMF_RESULT_ARGS (result));
-    goto error;
-  }
+  comp->SetProperty (AMF_VIDEO_ENCODER_MIN_QP, 22);//tm
+  comp->SetProperty (AMF_VIDEO_ENCODER_MAX_QP, 48);//tm
+  comp->SetProperty (AMF_VIDEO_ENCODER_QP_I, 22);//tm
+  comp->SetProperty (AMF_VIDEO_ENCODER_QP_P, 22);//tm
 
-  rc_mode = (AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_ENUM) int64_val;
-  if (self->min_qp >= 0)
-    comp->SetProperty (AMF_VIDEO_ENCODER_MIN_QP, (amf_int64) self->min_qp);
-  if (self->max_qp >= 0)
-    comp->SetProperty (AMF_VIDEO_ENCODER_MAX_QP, (amf_int64) self->max_qp);
 
-  comp->SetProperty (AMF_VIDEO_ENCODER_QP_I, (amf_int64) self->qp_i);
-  comp->SetProperty (AMF_VIDEO_ENCODER_QP_P, (amf_int64) self->qp_p);
-
-  switch (rc_mode) {
-    case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR:
-      if (self->bitrate > 0) {
-        comp->SetProperty (AMF_VIDEO_ENCODER_TARGET_BITRATE,
-            (amf_int64) self->bitrate * 1000);
-        comp->SetProperty (AMF_VIDEO_ENCODER_PEAK_BITRATE,
-            (amf_int64) self->bitrate * 1000);
-      }
-      break;
-    case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR:
-    case AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR:
-      if (self->bitrate > 0) {
-        comp->SetProperty (AMF_VIDEO_ENCODER_TARGET_BITRATE,
-            (amf_int64) self->bitrate * 1000);
-      }
-      if (self->max_bitrate > 0) {
-        comp->SetProperty (AMF_VIDEO_ENCODER_PEAK_BITRATE,
-            (amf_int64) self->max_bitrate * 1000);
-      }
-      break;
-    default:
-      break;
+  if (self->bitrate > 0) {
+    comp->SetProperty (AMF_VIDEO_ENCODER_TARGET_BITRATE,
+        (amf_int64) self->bitrate * 1000);//tm
+    comp->SetProperty (AMF_VIDEO_ENCODER_PEAK_BITRATE,
+        (amf_int64) self->bitrate * 1000);//tm
   }
 
   /* Disable frame skip for now, need investigation the behavior */
@@ -994,7 +986,7 @@ gst_amf_h264_enc_set_format (GstAmfEncoder * encoder,
   if (info->fps_n > 0 && info->fps_d) {
     framerate = AMFConstructRate (info->fps_n, info->fps_d);
   } else {
-    framerate = AMFConstructRate (25, 1);
+    framerate = AMFConstructRate (55, 1);
   }
 
   result = comp->SetProperty (AMF_VIDEO_ENCODER_FRAMERATE, framerate);
