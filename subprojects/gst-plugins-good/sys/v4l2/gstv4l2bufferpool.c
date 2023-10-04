@@ -1237,8 +1237,7 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer,
   GstV4l2Object *obj = pool->obj;
   GstClockTime timestamp;
   GstV4l2MemoryGroup *group;
-  GstVideoMeta *vmeta;
-  gsize size;
+  const GstVideoInfo *info = &obj->info;
   gint i;
   gint old_buffer_state;
 
@@ -1276,6 +1275,12 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer,
         group->buffer.index);
   }
 
+  if (group->buffer.flags & V4L2_BUF_FLAG_LAST &&
+      group->planes[0].bytesused == 0) {
+    GST_DEBUG_OBJECT (pool, "Empty last buffer, signalling eos.");
+    goto eos;
+  }
+
   outbuf = pool->buffers[group->buffer.index];
   if (outbuf == NULL)
     goto no_buffer;
@@ -1289,9 +1294,9 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer,
 
   timestamp = GST_TIMEVAL_TO_TIME (group->buffer.timestamp);
 
-  size = 0;
-  vmeta = gst_buffer_get_video_meta (outbuf);
   for (i = 0; i < group->n_mem; i++) {
+    const GstVideoFormatInfo *finfo = info->finfo;
+
     GST_LOG_OBJECT (pool,
         "dequeued buffer %p seq:%d (ix=%d), mem %p used %d, plane=%d, flags %08x, ts %"
         GST_TIME_FORMAT ", pool-queued=%d, buffer=%p, previous-state=%i",
@@ -1299,10 +1304,18 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer,
         group->planes[i].bytesused, i, group->buffer.flags,
         GST_TIME_ARGS (timestamp), pool->num_queued, outbuf, old_buffer_state);
 
-    if (vmeta) {
-      vmeta->offset[i] = size;
-      size += gst_memory_get_sizes (group->mem[i], NULL, NULL);
+    if (GST_VIDEO_INFO_FORMAT (&pool->caps_info) == GST_VIDEO_FORMAT_ENCODED)
+      break;
+
+    /* Ensure our offset matches the expected plane size, or image size if
+     * there is only one memory */
+    if (group->n_mem == 1) {
+      gst_memory_resize (group->mem[0], 0, info->size + info->offset[0]);
+      break;
     }
+
+    if (!GST_VIDEO_FORMAT_INFO_IS_TILED (finfo))
+      gst_memory_resize (group->mem[i], 0, obj->plane_size[i]);
   }
 
   /* Ignore timestamp and field for OUTPUT device */

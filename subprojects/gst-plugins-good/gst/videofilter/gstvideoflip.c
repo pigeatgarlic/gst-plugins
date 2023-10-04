@@ -1788,6 +1788,18 @@ gst_video_flip_sink_event (GstBaseTransform * trans, GstEvent * event)
 
       if (gst_video_orientation_from_tag (taglist, &method)) {
         gst_video_flip_set_method (vf, method, TRUE);
+
+        if (vf->method == GST_VIDEO_ORIENTATION_AUTO) {
+          /* Update the orientation tag as we rotate the video accordingly.
+           * The event (and so the tag list) can be shared so always copy both. */
+          taglist = gst_tag_list_copy (taglist);
+
+          gst_tag_list_add (taglist, GST_TAG_MERGE_REPLACE,
+              "image-orientation", "rotate-0", NULL);
+
+          gst_event_unref (event);
+          event = gst_event_new_tag (taglist);
+        }
       }
       break;
     default:

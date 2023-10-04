@@ -347,6 +347,8 @@ build clang fedora x86_64:
       -Dvaapi=disabled
       -Dgst-plugins-base:pango=enabled
       -Dgst-plugins-good:cairo=enabled
+      -Dgst-plugins-good:soup=enabled
+      -Dgst-plugins-good:soup-lookup-dep=true
     # Needs to not be empty otherwise the newline -> space replace command in
     # `script:` will fail
     MESON_CROSS_ARGS: ' '
@@ -359,6 +361,9 @@ build clang fedora x86_64:
         *modules_changes
     - changes:
         - subprojects/win-*/*
+  before_script:
+    # Install more recent version. We need at least 0.63 for diff_files support in wraps
+    - pip3 install -U meson==1.1.1
   script:
     # Make sure powershell exits on errors
     # https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_preference_variables?view=powershell-6
@@ -405,9 +410,12 @@ build vs2019 arm64 uwp:
     ARCH: 'arm64'
     # pango pulls in cairo which pulls in pixman which doesn't build because of
     # https://github.com/mesonbuild/meson/issues/9889
+    # libsoup requires glib-compile-resources, which isn't available in a cross
+    # build
     MESON_CROSS_ARGS: >
       -Dgst-plugins-base:pango=disabled
       -Dgst-plugins-good:cairo=disabled
+      -Dgst-plugins-good:soup-lookup-dep=false
       -Dgst-devtools:cairo=disabled
       --cross-file ci/meson/vs2019-arm64-cross-file.txt
       --native-file ci/meson/vs2019-x64-native-file.txt

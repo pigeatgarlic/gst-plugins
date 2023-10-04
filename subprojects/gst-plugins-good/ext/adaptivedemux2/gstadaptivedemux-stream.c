@@ -1427,7 +1427,7 @@ gst_adaptive_demux2_stream_begin_download_uri (GstAdaptiveDemux * demux,
   }
 
   if (!downloadhelper_submit_request (demux->download_helper,
-          demux->manifest_uri, DOWNLOAD_FLAG_NONE, request, NULL))
+          NULL, DOWNLOAD_FLAG_NONE, request, NULL))
     return GST_FLOW_ERROR;
 
   stream->download_active = TRUE;
@@ -2091,6 +2091,20 @@ gst_adaptive_demux2_stream_is_selected_locked (GstAdaptiveDemux2Stream * stream)
   for (tmp = stream->tracks; tmp; tmp = tmp->next) {
     GstAdaptiveDemuxTrack *track = tmp->data;
     if (track->selected)
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
+gboolean
+gst_adaptive_demux2_stream_is_default_locked (GstAdaptiveDemux2Stream * stream)
+{
+  GList *tmp;
+
+  for (tmp = stream->tracks; tmp; tmp = tmp->next) {
+    GstAdaptiveDemuxTrack *track = tmp->data;
+    if (track->flags & GST_STREAM_FLAG_SELECT)
       return TRUE;
   }
 

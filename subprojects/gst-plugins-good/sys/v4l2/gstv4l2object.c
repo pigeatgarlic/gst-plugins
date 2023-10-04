@@ -3441,18 +3441,11 @@ gst_v4l2_object_save_format (GstV4l2Object * v4l2object,
     if ((align->padding_left + align->padding_top) > 0)
       GST_WARNING_OBJECT (v4l2object->dbg_obj,
           "Left and top padding is not permitted for tiled formats");
+    memset (v4l2object->plane_size, 0,
+        sizeof (v4l2object->plane_size[0] * GST_VIDEO_MAX_PLANES));
   } else {
-    for (i = 0; i < finfo->n_planes; i++) {
-      gint vedge, hedge;
-
-      /* FIXME we assume plane as component as this is true for all supported
-       * format we support. */
-
-      hedge = GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (finfo, i, align->padding_left);
-      vedge = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (finfo, i, align->padding_top);
-
-      info->offset[i] += (vedge * info->stride[i]) +
-          (hedge * GST_VIDEO_INFO_COMP_PSTRIDE (info, i));
+    if (!gst_video_info_align_full (info, align, v4l2object->plane_size)) {
+      GST_WARNING_OBJECT (v4l2object->dbg_obj, "Failed to align video info");
     }
   }
 
@@ -4357,8 +4350,9 @@ gst_v4l2_object_acquire_format (GstV4l2Object * v4l2object, GstVideoInfo * info)
       goto unsupported_field;
   }
 
-  gst_video_info_set_interlaced_format (info, format, interlace_mode, width,
-      height);
+  if (!gst_video_info_set_interlaced_format (info, format, interlace_mode,
+          width, height))
+    goto invalid_dimensions;
 
   gst_v4l2_object_get_colorspace (v4l2object, &fmt, &info->colorimetry);
   gst_v4l2_object_get_streamparm (v4l2object, info);
@@ -5581,6 +5575,9 @@ again:
           "Received non-resolution source-change, ignoring.");
       goto again;
     }
+
+    if (v4l2object->formats)
+      gst_v4l2_object_clear_format_list (v4l2object);
 
     return GST_V4L2_FLOW_RESOLUTION_CHANGE;
   }

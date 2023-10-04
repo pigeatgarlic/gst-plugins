@@ -6092,13 +6092,22 @@ gst_qtdemux_push_buffer (GstQTDemux * qtdemux, QtDemuxStream * stream,
 
     if (info->crypto_info == NULL) {
       if (stream->protection_scheme_type == FOURCC_cbcs) {
-        crypto_info = qtdemux_get_cenc_sample_properties (qtdemux, stream, 0);
-        if (!crypto_info || !gst_buffer_add_protection_meta (buf, crypto_info)) {
-          GST_ERROR_OBJECT (qtdemux,
-              "failed to attach cbcs metadata to buffer");
-          qtdemux_gst_structure_free (crypto_info);
+        if (CUR_STREAM (stream)->fourcc == FOURCC_enca ||
+            CUR_STREAM (stream)->fourcc == FOURCC_encs ||
+            CUR_STREAM (stream)->fourcc == FOURCC_enct ||
+            CUR_STREAM (stream)->fourcc == FOURCC_encv) {
+          crypto_info = qtdemux_get_cenc_sample_properties (qtdemux, stream, 0);
+          if (!crypto_info
+              || !gst_buffer_add_protection_meta (buf, crypto_info)) {
+            GST_ERROR_OBJECT (qtdemux,
+                "failed to attach cbcs metadata to buffer");
+            qtdemux_gst_structure_free (crypto_info);
+          } else {
+            GST_TRACE_OBJECT (qtdemux, "added cbcs protection metadata");
+          }
         } else {
-          GST_TRACE_OBJECT (qtdemux, "added cbcs protection metadata");
+          GST_TRACE_OBJECT (qtdemux,
+              "cbcs stream is not encrypted yet, not adding protection metadata");
         }
       } else {
         GST_DEBUG_OBJECT (qtdemux,
@@ -7312,6 +7321,42 @@ gst_qtdemux_chain (GstPad * sinkpad, GstObject * parent, GstBuffer * inbuf)
   return gst_qtdemux_process_adapter (demux, FALSE);
 }
 
+static guint64
+gst_segment_to_stream_time_clamped (const GstSegment * segment,
+    guint64 position)
+{
+  guint64 segment_stream_time_start;
+  guint64 segment_stream_time_stop = GST_CLOCK_TIME_NONE;
+  guint64 stream_pts_unsigned;
+  int ret;
+
+  g_return_val_if_fail (segment != NULL, GST_CLOCK_TIME_NONE);
+  g_return_val_if_fail (segment->format == GST_FORMAT_TIME,
+      GST_CLOCK_TIME_NONE);
+
+  segment_stream_time_start = segment->time;
+  if (segment->stop != GST_CLOCK_TIME_NONE)
+    segment_stream_time_stop =
+        gst_segment_to_stream_time (segment, GST_FORMAT_TIME, segment->stop);
+
+  ret =
+      gst_segment_to_stream_time_full (segment, GST_FORMAT_TIME, position,
+      &stream_pts_unsigned);
+  /* ret == 0 if the segment is invalid (either position, segment->time or the segment start are -1). */
+  g_return_val_if_fail (ret != 0, GST_CLOCK_TIME_NONE);
+
+  if (ret == -1 || stream_pts_unsigned < segment_stream_time_start) {
+    /* Negative or prior to segment start stream time, clamp to segment start. */
+    return segment_stream_time_start;
+  } else if (segment_stream_time_stop != GST_CLOCK_TIME_NONE
+      && stream_pts_unsigned > segment_stream_time_stop) {
+    /* Clamp to segment end. */
+    return segment_stream_time_stop;
+  } else {
+    return stream_pts_unsigned;
+  }
+}
+
 static GstFlowReturn
 gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
 {
@@ -7720,7 +7765,7 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
       case QTDEMUX_STATE_MOVIE:{
         QtDemuxStream *stream = NULL;
         QtDemuxSample *sample;
-        GstClockTime dts, pts, duration;
+        GstClockTime dts, pts, stream_pts, duration;
         gboolean keyframe;
         gint i;
 
@@ -7832,12 +7877,14 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
 
           dts = QTSAMPLE_DTS (stream, sample);
           pts = QTSAMPLE_PTS (stream, sample);
+          stream_pts =
+              gst_segment_to_stream_time_clamped (&stream->segment, pts);
           duration = QTSAMPLE_DUR_DTS (stream, sample, dts);
           keyframe = QTSAMPLE_KEYFRAME (stream, sample);
 
           /* check for segment end */
           if (G_UNLIKELY (demux->segment.stop != -1
-                  && demux->segment.stop <= pts && stream->on_keyframe)
+                  && demux->segment.stop <= stream_pts && keyframe)
               && !(demux->upstream_format_is_time && demux->segment.rate < 0)) {
             GST_DEBUG_OBJECT (demux, "we reached the end of our segment.");
             stream->time_position = GST_CLOCK_TIME_NONE;        /* this means EOS */
@@ -8301,6 +8348,7 @@ qtdemux_parse_node (GstQTDemux * qtdemux, GNode * node, const guint8 * buffer,
       case FOURCC_alac:
       case FOURCC_fLaC:
       case FOURCC_aavd:
+      case FOURCC_opus:
       {
         guint32 version;
         guint32 offset;
@@ -8312,6 +8360,8 @@ qtdemux_parse_node (GstQTDemux * qtdemux, GNode * node, const guint8 * buffer,
           min_size = 20;
         else if (fourcc == FOURCC_fLaC)
           min_size = 86;
+        else if (fourcc == FOURCC_opus)
+          min_size = 55;
         else
           min_size = 40;
 
@@ -12883,37 +12933,101 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
         }
         case FOURCC_opus:
         {
-          const guint8 *dops_data;
           guint8 *channel_mapping = NULL;
-          guint32 rate;
-          guint8 channels;
+          guint32 dops_len, rate;
+          guint8 n_channels;
           guint8 channel_mapping_family;
           guint8 stream_count;
           guint8 coupled_count;
           guint8 i;
 
-          version = GST_READ_UINT16_BE (stsd_entry_data + 16);
-          if (version == 1)
-            dops_data = stsd_entry_data + 51;
-          else
-            dops_data = stsd_entry_data + 35;
+          GNode *opus;
+          GNode *dops;
 
-          channels = GST_READ_UINT8 (dops_data + 10);
-          rate = GST_READ_UINT32_LE (dops_data + 13);
-          channel_mapping_family = GST_READ_UINT8 (dops_data + 19);
-          stream_count = GST_READ_UINT8 (dops_data + 20);
-          coupled_count = GST_READ_UINT8 (dops_data + 21);
-
-          if (channels > 0) {
-            channel_mapping = g_malloc (channels * sizeof (guint8));
-            for (i = 0; i < channels; i++)
-              channel_mapping[i] = GST_READ_UINT8 (dops_data + i + 22);
+          opus = qtdemux_tree_get_child_by_type (stsd, FOURCC_opus);
+          if (opus == NULL) {
+            GST_WARNING_OBJECT (qtdemux, "Opus Sample Entry not found");
+            goto corrupt_file;
           }
 
-          entry->caps = gst_codec_utils_opus_create_caps (rate, channels,
+          dops = qtdemux_tree_get_child_by_type (opus, FOURCC_dops);
+          if (dops == NULL) {
+            GST_WARNING_OBJECT (qtdemux, "Opus Specific Box not found");
+            goto corrupt_file;
+          }
+
+          /* Opus Specific Box content:
+           * 4 bytes: length
+           * 4 bytes: "dOps"
+           * 1 byte: Version;
+           * 1 byte: OutputChannelCount;
+           * 2 bytes: PreSkip (big-endians);
+           * 4 bytes: InputSampleRate (big-endians);
+           * 2 bytes: OutputGain (big-endians);
+           * 1 byte: ChannelMappingFamily;
+           * if (ChannelMappingFamily != 0) {
+           *   1 byte: StreamCount;
+           *   1 byte: CoupledCount;
+           *   for (OutputChannel in 0..OutputChannelCount) {
+           *     1 byte: ChannelMapping;
+           *   }
+           * }
+           */
+
+          dops_len = QT_UINT32 ((guint8 *) dops->data);
+          if (len < offset + dops_len) {
+            GST_WARNING_OBJECT (qtdemux,
+                "Opus Sample Entry has bogus size %" G_GUINT32_FORMAT, len);
+            goto corrupt_file;
+          }
+          if (dops_len < 19) {
+            GST_WARNING_OBJECT (qtdemux,
+                "Opus Specific Box has bogus size %" G_GUINT32_FORMAT,
+                dops_len);
+            goto corrupt_file;
+          }
+
+          n_channels = GST_READ_UINT8 ((guint8 *) dops->data + 9);
+          rate = GST_READ_UINT32_BE ((guint8 *) dops->data + 12);
+          channel_mapping_family = GST_READ_UINT8 ((guint8 *) dops->data + 18);
+
+          if (channel_mapping_family != 0) {
+            if (dops_len < 21 + n_channels) {
+              GST_WARNING_OBJECT (qtdemux,
+                  "Opus Specific Box has bogus size %" G_GUINT32_FORMAT,
+                  dops_len);
+              goto corrupt_file;
+            }
+
+            stream_count = GST_READ_UINT8 ((guint8 *) dops->data + 19);
+            coupled_count = GST_READ_UINT8 ((guint8 *) dops->data + 20);
+
+            if (n_channels > 0) {
+              channel_mapping = g_malloc (n_channels * sizeof (guint8));
+              for (i = 0; i < n_channels; i++)
+                channel_mapping[i] =
+                    GST_READ_UINT8 ((guint8 *) dops->data + i + 21);
+            }
+          } else if (n_channels == 1) {
+            stream_count = 1;
+            coupled_count = 0;
+          } else if (n_channels == 2) {
+            stream_count = 1;
+            coupled_count = 1;
+          } else {
+            GST_WARNING_OBJECT (qtdemux,
+                "Opus unexpected nb of channels %d without channel mapping",
+                n_channels);
+            goto corrupt_file;
+          }
+
+          entry->caps = gst_codec_utils_opus_create_caps (rate, n_channels,
               channel_mapping_family, stream_count, coupled_count,
               channel_mapping);
           g_free (channel_mapping);
+
+          entry->sampled = TRUE;
+
           break;
         }
         default:
@@ -13266,6 +13380,7 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
             }
             break;
           }
+          case FOURCC_opus:
           case FOURCC_lpcm:
           case FOURCC_in24:
           case FOURCC_in32:
