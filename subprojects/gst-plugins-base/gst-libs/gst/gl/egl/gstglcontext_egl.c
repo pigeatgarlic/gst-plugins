@@ -1523,6 +1523,68 @@ failure:
 }
 
 #if GST_GL_HAVE_DMABUF
+static void
+_print_all_dma_formats (GstGLContext * context, GArray * dma_formats)
+{
+#ifndef GST_DISABLE_GST_DEBUG
+  GstGLDmaFormat *dma_fmt;
+  GstGLDmaModifier *dma_modifier;
+  const gchar *fmt_str, *gst_fmt_str;
+  GString *str;
+  guint i, j;
+
+  if (gst_debug_category_get_threshold (GST_CAT_DEFAULT) < GST_LEVEL_INFO)
+    return;
+
+  str = g_string_new (NULL);
+  g_string_append_printf (str, "\n============= All DMA Formats With"
+      " Modifiers =============");
+  g_string_append_printf (str, "\n| Gst Format   | DRM Format      "
+      "        | External Flag |");
+  g_string_append_printf (str, "\n|================================"
+      "========================|");
+
+  for (i = 0; i < dma_formats->len; i++) {
+    dma_fmt = &g_array_index (dma_formats, GstGLDmaFormat, i);
+
+    gst_fmt_str = gst_video_format_to_string
+        (gst_video_dma_drm_fourcc_to_format (dma_fmt->fourcc));
+
+    g_string_append_printf (str, "\n| %-12s |", gst_fmt_str);
+
+    if (!dma_fmt->modifiers) {
+      fmt_str = gst_video_dma_drm_fourcc_to_string (dma_fmt->fourcc, 0);
+      g_string_append_printf (str, " %-23s |", fmt_str);
+      g_string_append_printf (str, " %-13s |\n", "external only");
+    } else {
+      for (j = 0; j < dma_fmt->modifiers->len; j++) {
+        dma_modifier = &g_array_index (dma_fmt->modifiers, GstGLDmaModifier, j);
+
+        fmt_str = gst_video_dma_drm_fourcc_to_string (dma_fmt->fourcc,
+            dma_modifier->modifier);
+
+        if (j > 0)
+          g_string_append_printf (str, "|              |");
+
+        g_string_append_printf (str, " %-23s |", fmt_str);
+        g_string_append_printf (str, " %-13s |\n", dma_modifier->external_only ?
+            "external only" : "");
+      }
+    }
+
+    if (i < dma_formats->len - 1)
+      g_string_append_printf (str, "|--------------------------------"
+          "------------------------|");
+  }
+
+  g_string_append_printf (str, "================================="
+      "=========================");
+
+  GST_INFO_OBJECT (context, "%s", str->str);
+  g_string_free (str, TRUE);
+#endif
+}
+
 static int
 _compare_dma_formats (gconstpointer a, gconstpointer b)
 {
@@ -1692,6 +1754,8 @@ gst_gl_context_egl_fetch_dma_formats (GstGLContext * context)
 
   g_array_sort (dma_formats, _compare_dma_formats);
 
+  _print_all_dma_formats (context, dma_formats);
+
   GST_OBJECT_LOCK (context);
   egl->dma_formats = dma_formats;
   GST_OBJECT_UNLOCK (context);
@@ -1705,7 +1769,6 @@ gst_gl_context_egl_fetch_dma_formats (GstGLContext * context)
 failed:
   {
     g_free (formats);
-    GST_OBJECT_UNLOCK (context);
     return FALSE;
   }
 }
@@ -1761,4 +1824,24 @@ beach:
   return ret;
 #endif
   return FALSE;
+}
+
+/**
+ * gst_gl_context_egl_supports_modifier: (skip)
+ * @context: an EGL #GStGLContext
+ *
+ * Returns: %TRUE if the @context supports the modifiers.
+ *
+ * Since: 1.24
+ */
+gboolean
+gst_gl_context_egl_supports_modifier (GstGLContext * context)
+{
+#if GST_GL_HAVE_DMABUF
+  g_return_val_if_fail (GST_IS_GL_CONTEXT_EGL (context), FALSE);
+
+  return gst_gl_context_egl_fetch_dma_formats (context);
+#else
+  return FALSE;
+#endif
 }

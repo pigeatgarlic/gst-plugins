@@ -136,6 +136,8 @@ struct _GstH265DecoderPrivate
   GstQueueArray *output_queue;
 
   gboolean input_state_changed;
+
+  GstFlowReturn last_flow;
 };
 
 typedef struct
@@ -267,6 +269,7 @@ gst_h265_decoder_start (GstVideoDecoder * decoder)
   priv->dpb = gst_h265_dpb_new ();
   priv->new_bitstream = TRUE;
   priv->prev_nal_is_eos = FALSE;
+  priv->last_flow = GST_FLOW_OK;
 
   return TRUE;
 }
@@ -838,7 +841,6 @@ gst_h265_decoder_process_slice (GstH265Decoder * self, GstH265Slice * slice)
   priv->active_sps = priv->active_pps->sps;
 
   if (!priv->current_picture) {
-    GstH265DecoderClass *klass = GST_H265_DECODER_GET_CLASS (self);
     GstH265Picture *picture;
     GstFlowReturn ret = GST_FLOW_OK;
 
@@ -846,19 +848,10 @@ gst_h265_decoder_process_slice (GstH265Decoder * self, GstH265Slice * slice)
 
     picture = gst_h265_picture_new ();
     /* This allows accessing the frame from the picture. */
-    picture->system_frame_number = priv->current_frame->system_frame_number;
+    GST_CODEC_PICTURE_FRAME_NUMBER (picture) =
+        priv->current_frame->system_frame_number;
 
     priv->current_picture = picture;
-
-    if (klass->new_picture)
-      ret = klass->new_picture (self, priv->current_frame, picture);
-
-    if (ret != GST_FLOW_OK) {
-      GST_WARNING_OBJECT (self, "subclass does not want accept new picture");
-      priv->current_picture = NULL;
-      gst_h265_picture_unref (picture);
-      return ret;
-    }
 
     ret = gst_h265_decoder_start_current_picture (self);
     if (ret != GST_FLOW_OK) {
@@ -1696,7 +1689,6 @@ gst_h265_decoder_do_output_picture (GstH265Decoder * self,
   GstH265DecoderPrivate *priv = self->priv;
   GstVideoCodecFrame *frame = NULL;
   GstH265DecoderOutputFrame output_frame;
-  GstFlowReturn flow_ret = GST_FLOW_OK;
 
   g_assert (ret != NULL);
 
@@ -1712,12 +1704,12 @@ gst_h265_decoder_do_output_picture (GstH265Decoder * self,
   priv->last_output_poc = picture->pic_order_cnt;
 
   frame = gst_video_decoder_get_frame (GST_VIDEO_DECODER (self),
-      picture->system_frame_number);
+      GST_CODEC_PICTURE_FRAME_NUMBER (picture));
 
   if (!frame) {
     GST_ERROR_OBJECT (self,
         "No available codec frame with frame number %d",
-        picture->system_frame_number);
+        GST_CODEC_PICTURE_FRAME_NUMBER (picture));
     UPDATE_FLOW_RETURN (ret, GST_FLOW_ERROR);
 
     gst_h265_picture_unref (picture);
@@ -1730,8 +1722,7 @@ gst_h265_decoder_do_output_picture (GstH265Decoder * self,
   gst_queue_array_push_tail_struct (priv->output_queue, &output_frame);
 
   gst_h265_decoder_drain_output_queue (self, priv->preferred_output_delay,
-      &flow_ret);
-  UPDATE_FLOW_RETURN (ret, flow_ret);
+      &priv->last_flow);
 }
 
 static void
@@ -1746,7 +1737,7 @@ gst_h265_decoder_clear_dpb (GstH265Decoder * self, gboolean flush)
   if (!flush) {
     while ((picture = gst_h265_dpb_bump (priv->dpb, TRUE)) != NULL) {
       GstVideoCodecFrame *frame = gst_video_decoder_get_frame (decoder,
-          picture->system_frame_number);
+          GST_CODEC_PICTURE_FRAME_NUMBER (picture));
 
       if (frame)
         gst_video_decoder_release_frame (decoder, frame);
@@ -1791,7 +1782,7 @@ gst_h265_decoder_dpb_init (GstH265Decoder * self, const GstH265Slice * slice,
   if (slice->clear_dpb) {
     if (picture->NoOutputOfPriorPicsFlag) {
       GST_DEBUG_OBJECT (self, "Clear dpb");
-      gst_h265_decoder_drain_output_queue (self, 0, &ret);
+      gst_h265_decoder_drain_output_queue (self, 0, &priv->last_flow);
       gst_h265_decoder_clear_dpb (self, FALSE);
     } else {
       gst_h265_dpb_delete_unused (priv->dpb);
@@ -1847,16 +1838,8 @@ gst_h265_decoder_start_current_picture (GstH265Decoder * self)
   if (GST_H265_IS_NAL_TYPE_RASL (priv->current_slice.nalu.type) &&
       priv->associated_irap_NoRaslOutputFlag) {
     GST_DEBUG_OBJECT (self, "Drop current picture");
-    gst_h265_picture_replace (&priv->current_picture, NULL);
+    gst_clear_h265_picture (&priv->current_picture);
     return GST_FLOW_OK;
-  }
-
-  /* If subclass didn't update output state at this point,
-   * marking this picture as a discont and stores current input state */
-  if (priv->input_state_changed) {
-    priv->current_picture->discont_state =
-        gst_video_codec_state_ref (self->input_state);
-    priv->input_state_changed = FALSE;
   }
 
   if (!gst_h265_decoder_prepare_rps (self, &priv->current_slice,
@@ -1870,18 +1853,38 @@ gst_h265_decoder_start_current_picture (GstH265Decoder * self)
       &priv->current_slice, priv->current_picture);
   if (ret != GST_FLOW_OK) {
     GST_WARNING_OBJECT (self, "Failed to init dpb");
+    gst_clear_h265_picture (&priv->current_picture);
     return ret;
   }
 
   klass = GST_H265_DECODER_GET_CLASS (self);
+
+  if (klass->new_picture)
+    ret = klass->new_picture (self, priv->current_frame, priv->current_picture);
+
+  if (ret != GST_FLOW_OK) {
+    GST_WARNING_OBJECT (self, "subclass does not want accept new picture");
+    gst_clear_h265_picture (&priv->current_picture);
+    return ret;
+  }
+
   if (klass->start_picture) {
     ret = klass->start_picture (self, priv->current_picture,
         &priv->current_slice, priv->dpb);
 
     if (ret != GST_FLOW_OK) {
       GST_WARNING_OBJECT (self, "subclass does not want to start picture");
+      gst_clear_h265_picture (&priv->current_picture);
       return ret;
     }
+  }
+
+  /* If subclass didn't update output state at this point,
+   * marking this picture as a discont and stores current input state */
+  if (priv->input_state_changed) {
+    gst_h265_picture_set_discont_state (priv->current_picture,
+        self->input_state);
+    priv->input_state_changed = FALSE;
   }
 
   return GST_FLOW_OK;
@@ -1906,7 +1909,7 @@ gst_h265_decoder_finish_picture (GstH265Decoder * self,
   /* This picture is decode only, drop corresponding frame */
   if (!picture->output_flag) {
     GstVideoCodecFrame *frame = gst_video_decoder_get_frame (decoder,
-        picture->system_frame_number);
+        GST_CODEC_PICTURE_FRAME_NUMBER (picture));
 
     gst_video_decoder_release_frame (decoder, frame);
   }
@@ -1999,6 +2002,7 @@ gst_h265_decoder_handle_frame (GstVideoDecoder * decoder,
 
   gst_h265_decoder_reset_frame_state (self);
 
+  priv->last_flow = GST_FLOW_OK;
   priv->current_frame = frame;
 
   if (!gst_buffer_map (in_buf, &map, GST_MAP_READ)) {
@@ -2066,7 +2070,7 @@ gst_h265_decoder_handle_frame (GstVideoDecoder * decoder,
           ("Failed to decode data"), (NULL), decode_ret);
     }
 
-    gst_video_decoder_drop_frame (decoder, frame);
+    gst_video_decoder_release_frame (decoder, frame);
     gst_clear_h265_picture (&priv->current_picture);
 
     return decode_ret;
@@ -2078,6 +2082,12 @@ gst_h265_decoder_handle_frame (GstVideoDecoder * decoder,
   } else {
     /* This picture was dropped */
     gst_video_decoder_release_frame (decoder, frame);
+  }
+
+  if (priv->last_flow != GST_FLOW_OK) {
+    GST_DEBUG_OBJECT (self,
+        "Last flow %s", gst_flow_get_name (priv->last_flow));
+    return priv->last_flow;
   }
 
   if (decode_ret == GST_FLOW_ERROR) {

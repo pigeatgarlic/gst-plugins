@@ -2669,7 +2669,7 @@ gst_rtp_jitter_buffer_handle_missing_packets (GstRtpJitterBuffer * jitterbuffer,
 
       /* based on the estimated packet duration, we
          can figure out how many packets we could possibly save */
-      if (est_pkt_duration)
+      if (est_pkt_duration && offset > 0)
         max_saveable_packets = offset / est_pkt_duration;
 
       /* and say that the amount of lost packet is the sequence-number
@@ -4834,6 +4834,12 @@ out:
 
   priv->last_known_ext_rtptime = ext_rtptime;
   priv->last_known_ntpnstime = ntpnstime;
+
+  if (G_UNLIKELY (priv->last_ssrc == -1)) {
+    GST_DEBUG_OBJECT (jitterbuffer, "SSRC changed from %u to %u",
+        priv->last_ssrc, ssrc);
+    priv->last_ssrc = ssrc;
+  }
 
   if (priv->last_ntpnstime != GST_CLOCK_TIME_NONE
       && ntpnstime - priv->last_ntpnstime < priv->sync_interval * GST_MSECOND) {

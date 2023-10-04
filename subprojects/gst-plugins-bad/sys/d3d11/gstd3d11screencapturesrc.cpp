@@ -390,7 +390,9 @@ gst_d3d11_screen_capture_src_class_init (GstD3D11ScreenCaptureSrcClass * klass)
                 GST_PARAM_CONDITIONALLY_AVAILABLE | G_PARAM_STATIC_STRINGS)));
 
     /**
-     * GstD3D11ScreenCaptureSrc:hwnd-capture-mode:
+     * GstD3D11ScreenCaptureSrc:window-capture-mode:
+     *
+     * Window capture mode to use
      *
      * Since: 1.24
      */
@@ -868,48 +870,6 @@ error:
 static gboolean
 gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
 {
-  /* *INDENT-OFF* */
-  static const gchar vs_str[] =
-      "struct VS_INPUT {\n"
-      "  float4 Position: POSITION;\n"
-      "  float2 Texture: TEXCOORD;\n"
-      "};\n"
-      "\n"
-      "struct VS_OUTPUT {\n"
-      "  float4 Position: SV_POSITION;\n"
-      "  float2 Texture: TEXCOORD;\n"
-      "};\n"
-      "\n"
-      "VS_OUTPUT main (VS_INPUT input)\n"
-      "{\n"
-      "  return input;\n"
-      "}";
-  static const gchar ps_str[] =
-      "Texture2D shaderTexture;\n"
-      "SamplerState samplerState;\n"
-      "\n"
-      "struct PS_INPUT {\n"
-      "  float4 Position: SV_POSITION;\n"
-      "  float2 Texture: TEXCOORD;\n"
-      "};\n"
-      "\n"
-      "struct PS_OUTPUT {\n"
-      "  float4 Plane: SV_Target;\n"
-      "};\n"
-      "\n"
-      "PS_OUTPUT main(PS_INPUT input)\n"
-      "{\n"
-      "  PS_OUTPUT output;\n"
-      "  output.Plane = shaderTexture.Sample(samplerState, input.Texture);\n"
-      "  return output;\n"
-      "}";
-  /* *INDENT-ON* */
-  D3D11_INPUT_ELEMENT_DESC input_desc[] = {
-    {"POSITION",
-        0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-    {"TEXCOORD",
-        0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0}
-  };
   ComPtr < ID3D11VertexShader > vs;
   ComPtr < ID3D11InputLayout > layout;
   ComPtr < ID3D11PixelShader > ps;
@@ -922,14 +882,13 @@ gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
 
   device_handle = gst_d3d11_device_get_device_handle (self->device);
 
-  hr = gst_d3d11_create_vertex_shader_simple (self->device,
-      vs_str, "main", input_desc, G_N_ELEMENTS (input_desc), &vs, &layout);
+  hr = gst_d3d11_get_vertex_shader_coord (self->device, &vs, &layout);
   if (!gst_d3d11_result (hr, self->device)) {
     GST_ERROR_OBJECT (self, "Failed to create vertex shader");
     return FALSE;
   }
 
-  hr = gst_d3d11_create_pixel_shader_simple (self->device, ps_str, "main", &ps);
+  hr = gst_d3d11_get_pixel_shader_sample (self->device, &ps);
   if (!gst_d3d11_result (hr, self->device)) {
     GST_ERROR_OBJECT (self, "Failed to create pixel shader");
     return FALSE;

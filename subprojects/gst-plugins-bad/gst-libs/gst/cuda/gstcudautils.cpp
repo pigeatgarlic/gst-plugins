@@ -25,6 +25,9 @@
 #include "gstcudacontext.h"
 #include "gstcuda-private.h"
 #include <atomic>
+#include <set>
+#include <string>
+#include <mutex>
 
 #ifdef HAVE_CUDA_GST_GL
 #include <gst/gl/gl.h>
@@ -33,6 +36,7 @@
 
 #ifdef G_OS_WIN32
 #include <gst/d3d11/gstd3d11.h>
+#include <sddl.h>
 #endif
 
 #ifdef HAVE_NVCODEC_NVMM
@@ -1304,8 +1308,14 @@ ensure_d3d11_interop (GstCudaContext * context, GstD3D11Device * device)
 static GstCudaGraphicsResource *
 ensure_cuda_d3d11_graphics_resource (GstCudaContext * context, GstMemory * mem)
 {
-  GQuark quark;
+  static gint64 d3d11_interop_token = 0;
+  static std::once_flag once_flag;
   GstCudaGraphicsResource *ret = nullptr;
+  GstD3D11Memory *dmem;
+
+  GST_CUDA_CALL_ONCE_BEGIN {
+    d3d11_interop_token = gst_d3d11_create_user_token ();
+  } GST_CUDA_CALL_ONCE_END;
 
   if (!gst_is_d3d11_memory (mem)) {
     GST_WARNING_OBJECT (context, "memory is not D3D11 memory, %s",
@@ -1313,9 +1323,9 @@ ensure_cuda_d3d11_graphics_resource (GstCudaContext * context, GstMemory * mem)
     return nullptr;
   }
 
-  quark = gst_cuda_quark_from_id (GST_CUDA_QUARK_GRAPHICS_RESOURCE);
+  dmem = GST_D3D11_MEMORY_CAST (mem);
   ret = (GstCudaGraphicsResource *)
-      gst_mini_object_get_qdata (GST_MINI_OBJECT (mem), quark);
+      gst_d3d11_memory_get_token_data (dmem, d3d11_interop_token);
 
   if (!ret) {
     ret = gst_cuda_graphics_resource_new (context,
@@ -1328,11 +1338,11 @@ ensure_cuda_d3d11_graphics_resource (GstCudaContext * context, GstMemory * mem)
       GST_ERROR_OBJECT (context, "failed to register d3d11 resource");
       gst_cuda_graphics_resource_free (ret);
 
-      return nullptr;
+      ret = nullptr;
+    } else {
+      gst_d3d11_memory_set_token_data (dmem, d3d11_interop_token, ret,
+          (GDestroyNotify) gst_cuda_graphics_resource_free);
     }
-
-    gst_mini_object_set_qdata (GST_MINI_OBJECT (mem), quark, ret,
-        (GDestroyNotify) gst_cuda_graphics_resource_free);
   }
 
   return ret;
@@ -1670,4 +1680,158 @@ gst_cuda_create_user_token (void)
   /* *INDENT-ON* */
 
   return user_token.fetch_add (1);
+}
+
+static gboolean
+_abort_on_error (CUresult result)
+{
+  static std::set < CUresult > abort_list;
+  GST_CUDA_CALL_ONCE_BEGIN {
+    const gchar *env = g_getenv ("GST_CUDA_CRITICAL_ERRORS");
+    if (!env)
+      return;
+
+    gchar **split = g_strsplit (env, ",", 0);
+    gchar **iter;
+    for (iter = split; *iter; iter++) {
+      int error_code = 0;
+      try {
+        error_code = std::stoi (*iter);
+      } catch ( ...) {
+        GST_WARNING ("Invalid argument \"%s\"", *iter);
+        continue;
+      };
+
+      if (error_code > 0)
+        abort_list.insert ((CUresult) error_code);
+    }
+
+    g_strfreev (split);
+  }
+  GST_CUDA_CALL_ONCE_END;
+
+  if (abort_list.empty ())
+    return FALSE;
+
+  if (abort_list.find (result) != abort_list.end ())
+    return TRUE;
+
+  return FALSE;
+}
+
+/**
+ * _gst_cuda_debug:
+ * @result: CUDA result code
+ * @cat: a #GstDebugCategory
+ * @file: the file that checking the result code
+ * @function: the function that checking the result code
+ * @line: the line that checking the result code
+ *
+ * Returns: %TRUE if CUDA device API call result is CUDA_SUCCESS
+ *
+ * Since: 1.24
+ */
+gboolean
+_gst_cuda_debug (CUresult result, GstDebugCategory * cat,
+    const gchar * file, const gchar * function, gint line)
+{
+  if (result != CUDA_SUCCESS) {
+#ifndef GST_DISABLE_GST_DEBUG
+    const gchar *_error_name, *_error_text;
+    CuGetErrorName (result, &_error_name);
+    CuGetErrorString (result, &_error_text);
+    gst_debug_log (cat, GST_LEVEL_WARNING, file, function, line,
+        NULL, "CUDA call failed: %s, %s", _error_name, _error_text);
+#endif
+    if (_abort_on_error (result)) {
+      GST_ERROR ("Critical error %d, abort", (gint) result);
+      g_abort ();
+    }
+
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+#ifdef G_OS_WIN32
+/* Defined in ntdef.h */
+struct OBJECT_ATTRIBUTES
+{
+  ULONG Length;
+  HANDLE RootDirectory;
+  PVOID ObjectName;
+  ULONG Attributes;
+  PVOID SecurityDescriptor;
+  PVOID SecurityQualityOfService;
+};
+#endif
+
+gpointer
+gst_cuda_get_win32_handle_metadata (void)
+{
+#ifdef G_OS_WIN32
+  static const gchar sddl[] = "D:P(OA;;GARCSDWDWORPWPCCDCLCSWLODTCRFA;;;WD)";
+  static OBJECT_ATTRIBUTES attr;
+  static BOOL initialized = FALSE;
+
+  /*
+   * D:P(string_ace) -> DACL protected with "string_ace"
+   *
+   * ace_string format
+   * ace_type;ace_flags;rights;object_guid;inherit_object_guid;account_sid
+   *
+   * ace_type: OA (ACCESS_ALLOWED_OBJECT_ACE_TYPE)
+   *
+   * ace_flags: (empty)
+   *
+   * rights: GARCSDWDWOCCDCLCSWLODTWPRPCRFA (allow all)
+   * - Generic access rights
+   *   GA (GENERIC_ALL)
+   * - Standard access right
+   *   RC (READ_CONTROL) SD (DELETE) WD (WRITE_DAC) WO (WRITE_OWNER)
+   * - Directory service object access right
+   *   RP (ADS_RIGHT_DS_READ_PROP)
+   *   WP (ADS_RIGHT_DS_WRITE_PROP)
+   *   CC (ADS_RIGHT_DS_CREATE_CHILD)
+   *   DC (ADS_RIGHT_DS_DELETE_CHILD)
+   *   LC (ADS_RIGHT_ACTRL_DS_LIST)
+   *   SW (ADS_RIGHT_DS_SELF)
+   *   LO (ADS_RIGHT_DS_LIST_OBJECT)
+   *   DT (ADS_RIGHT_DS_DELETE_TREE)
+   *   CR (ADS_RIGHT_DS_CONTROL_ACCESS)
+   * - File access rights
+   *   FA (FILE_GENERIC_ALL)
+   *
+   * object_guid: (empty)
+   *
+   * inherit_object_guid (empty)
+   *
+   * account_sid: WD (SDDL_EVERYONE)
+   *
+   * See also
+   * https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-string-format
+   */
+  GST_CUDA_CALL_ONCE_BEGIN {
+    PSECURITY_DESCRIPTOR desc;
+
+    memset (&attr, 0, sizeof (OBJECT_ATTRIBUTES));
+
+    initialized = ConvertStringSecurityDescriptorToSecurityDescriptorA (sddl,
+        SDDL_REVISION_1, &desc, nullptr);
+    if (!initialized)
+      return;
+
+    attr.Length = sizeof (OBJECT_ATTRIBUTES);
+    attr.SecurityDescriptor = desc;
+  }
+  GST_CUDA_CALL_ONCE_END;
+
+  if (!initialized)
+    return nullptr;
+
+  return &attr;
+#else
+  return nullptr;
+#endif
 }

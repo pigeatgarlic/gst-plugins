@@ -105,7 +105,6 @@ dnf install -y \
     valgrind \
     vulkan \
     vulkan-devel \
-    mesa-omx-drivers \
     mesa-libGL \
     mesa-libGL-devel \
     mesa-libGLU \
@@ -220,7 +219,7 @@ rm -f *.rpm
 
 # Install Rust
 RUSTUP_VERSION=1.26.0
-RUST_VERSION=1.70.0
+RUST_VERSION=1.72.1
 RUST_ARCH="x86_64-unknown-linux-gnu"
 
 dnf install -y wget
@@ -233,11 +232,13 @@ export CARGO_HOME="/usr/local/cargo"
 export PATH="/usr/local/cargo/bin:$PATH"
 
 chmod +x rustup-init;
-./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION;
+./rustup-init -y --no-modify-path --default-toolchain $RUST_VERSION;
 rm rustup-init;
 chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
-cargo install cargo-c --version 0.9.20+cargo-0.71
+# Apparently rustup did not do that, and it fails now
+cargo install cargo-c --version 0.9.24+cargo-0.73.0
+
 rustup --version
 cargo --version
 rustc --version
@@ -246,7 +247,7 @@ rustc --version
 git clone -b ${GIT_BRANCH} ${GIT_URL} /gstreamer
 git -C /gstreamer submodule update --init --depth=1
 meson subprojects download --sourcedir /gstreamer
-/gstreamer/ci/scripts/handle-subprojects-cache.py --build /gstreamer/subprojects/
+/gstreamer/ci/scripts/handle-subprojects-cache.py --build --cache-dir /subprojects /gstreamer/subprojects/
 
 # Run git gc to prune unwanted refs and reduce the size of the image
 for i in $(find /subprojects/ -mindepth 1 -maxdepth 1 -type d);

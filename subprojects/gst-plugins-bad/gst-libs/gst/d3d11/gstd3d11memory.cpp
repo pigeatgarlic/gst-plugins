@@ -1416,8 +1416,6 @@ gboolean
 gst_d3d11_memory_get_nt_handle (GstD3D11Memory * mem, HANDLE * handle)
 {
   GstD3D11MemoryPrivate *priv;
-  const guint misc_flags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
-      D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
   ComPtr < IDXGIResource1 > resource;
   HRESULT hr;
 
@@ -1437,8 +1435,10 @@ gst_d3d11_memory_get_nt_handle (GstD3D11Memory * mem, HANDLE * handle)
     return TRUE;
   }
 
-  if ((priv->desc.MiscFlags & misc_flags) != misc_flags)
+  if ((priv->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) !=
+      D3D11_RESOURCE_MISC_SHARED_NTHANDLE) {
     return FALSE;
+  }
 
   hr = priv->texture->QueryInterface (IID_PPV_ARGS (&resource));
   if (!gst_d3d11_result (hr, mem->device))
@@ -1956,7 +1956,7 @@ struct _GstD3D11PoolAllocatorPrivate
 
   std::atomic<guint> outstanding;
   guint cur_mems = 0;
-  gboolean flushing = FALSE;
+  gboolean flushing = TRUE;
 
   /* Calculated memory size, based on Direct3D11 staging texture map.
    * Note that, we cannot know the actually staging texture memory size prior

@@ -84,6 +84,8 @@
 
 #include <gst/tag/tag.h>
 
+#include <gst/glib-compat-private.h>
+
 /* this is a simple wrapper class around SoupSession; it exists in order to
  * have a refcountable owner for the actual SoupSession + the thread it runs
  * in and its main loop (we cannot inverse the ownership hierarchy, because
@@ -94,6 +96,7 @@
 
 #define GST_TYPE_SOUP_SESSION (gst_soup_session_get_type())
 #define GST_SOUP_SESSION(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), GST_TYPE_SOUP_SESSION, GstSoupSession))
+#define gst_soup_session_parent_class session_parent_class
 
 GType gst_soup_session_get_type (void);
 
@@ -137,8 +140,9 @@ gst_soup_session_finalize (GObject * obj)
   GSource *src;
 
   /* handle disposing of failure cases */
-  if (!sess->loop)
-    return;
+  if (!sess->loop) {
+    goto cleanup;
+  }
 
   src = g_idle_source_new ();
 
@@ -150,6 +154,8 @@ gst_soup_session_finalize (GObject * obj)
   g_assert (!g_main_context_is_owner (g_main_loop_get_context (sess->loop)));
   g_thread_join (sess->thread);
   g_main_loop_unref (sess->loop);
+cleanup:
+  G_OBJECT_CLASS (session_parent_class)->finalize (obj);
 }
 
 static void
@@ -198,7 +204,15 @@ enum
   PROP_TLS_INTERACTION,
 };
 
-#define DEFAULT_USER_AGENT           "GStreamer souphttpsrc " PACKAGE_VERSION " "
+enum
+{
+  SIGNAL_ACCEPT_CERTIFICATE,
+  LAST_SIGNAL,
+};
+
+static guint gst_soup_http_src_signals[LAST_SIGNAL] = { 0 };
+
+#define DEFAULT_USER_AGENT           "GStreamer souphttpsrc {VERSION} "
 #define DEFAULT_IRADIO_MODE          TRUE
 #define DEFAULT_SOUP_LOG_LEVEL       SOUP_LOGGER_LOG_HEADERS
 #define DEFAULT_COMPRESS             FALSE
@@ -424,7 +438,8 @@ gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
   g_object_class_install_property (gobject_class, PROP_SSL_CA_FILE,
       g_param_spec_string ("ssl-ca-file", "SSL CA File",
           "Location of a SSL anchor CA file to use", DEFAULT_SSL_CA_FILE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
+          | GST_PARAM_DOC_SHOW_DEFAULT));
 
   /**
    * GstSoupHTTPSrc::ssl-use-system-ca-file:
@@ -440,7 +455,8 @@ gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
   g_object_class_install_property (gobject_class, PROP_SSL_USE_SYSTEM_CA_FILE,
       g_param_spec_boolean ("ssl-use-system-ca-file", "Use System CA File",
           "Use system CA file", DEFAULT_SSL_USE_SYSTEM_CA_FILE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
+          | GST_PARAM_DOC_SHOW_DEFAULT));
 
   /**
    * GstSoupHTTPSrc::tls-database:
@@ -496,6 +512,27 @@ gst_soup_http_src_class_init (GstSoupHTTPSrcClass * klass)
       g_param_spec_string ("method", "HTTP method",
           "The HTTP method to use (GET, HEAD, OPTIONS, etc)",
           DEFAULT_SOUP_METHOD, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  /**
+   * GstSoupHTTPSrc::accept-certificate:
+   * @souphttpsrc: a #GstSoupHTTPSrc
+   * @peer_cert: the peer's #GTlsCertificate
+   * @errors: the problems with @peer_cert
+   *
+   * This will directly map to #SoupMessage 's "accept-certificate" after
+   * an unacceptable TLS certificate has been received, and only for libsoup 3.x
+   * or above. If "ssl-strict" was set to %FALSE, this signal will not be
+   * emitted.
+   *
+   * Returns: %TRUE to accept the TLS certificate and stop other handlers from
+   * being invoked, or %FALSE to propagate the event further.
+   *
+   * Since: 1.24
+   */
+  gst_soup_http_src_signals[SIGNAL_ACCEPT_CERTIFICATE] =
+      g_signal_new ("accept-certificate", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST, 0, g_signal_accumulator_true_handled, NULL, NULL,
+      G_TYPE_BOOLEAN, 2, G_TYPE_TLS_CERTIFICATE, G_TYPE_TLS_CERTIFICATE_FLAGS);
 
   gst_element_class_add_static_pad_template (gstelement_class, &srctemplate);
 
@@ -1312,6 +1349,7 @@ gst_soup_http_src_accept_certificate_cb (SoupMessage * msg,
     gpointer user_data)
 {
   GstSoupHTTPSrc *src = user_data;
+  gboolean accept = FALSE;
 
   /* Might be from another user of the shared session */
   if (!GST_IS_SOUP_HTTP_SRC (src) || msg != src->msg)
@@ -1321,7 +1359,10 @@ gst_soup_http_src_accept_certificate_cb (SoupMessage * msg,
   if (!src->ssl_strict)
     return TRUE;
 
-  return FALSE;
+  g_signal_emit (src, gst_soup_http_src_signals[SIGNAL_ACCEPT_CERTIFICATE], 0,
+      tls_certificate, tls_errors, &accept);
+
+  return accept;
 }
 
 static void
@@ -1729,22 +1770,16 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
   /* Duplicating the defaults of libsoup here. We don't want to set a
    * User-Agent in the session as each source might have its own User-Agent
    * set */
-  if (!src->user_agent || !*src->user_agent) {
-    gchar *user_agent =
-        g_strdup_printf ("libsoup/%u.%u.%u", _soup_get_major_version (),
-        _soup_get_minor_version (), _soup_get_micro_version ());
-    _soup_message_headers_append (request_headers, "User-Agent", user_agent);
-    g_free (user_agent);
-  } else if (g_str_has_suffix (src->user_agent, " ")) {
-    gchar *user_agent = g_strdup_printf ("%slibsoup/%u.%u.%u", src->user_agent,
-        _soup_get_major_version (),
-        _soup_get_minor_version (), _soup_get_micro_version ());
-    _soup_message_headers_append (request_headers, "User-Agent", user_agent);
-    g_free (user_agent);
-  } else {
-    _soup_message_headers_append (request_headers, "User-Agent",
-        src->user_agent);
+  GString *user_agent = g_string_new (src->user_agent);
+  g_string_replace (user_agent, "{VERSION}", PACKAGE_VERSION, 0);
+  if (user_agent->len == 0 || g_str_has_suffix (user_agent->str, " ")) {
+    g_string_append_printf (user_agent, "libsoup/%u.%u.%u",
+        _soup_get_major_version (), _soup_get_minor_version (),
+        _soup_get_micro_version ());
   }
+  _soup_message_headers_append (request_headers, "User-Agent", user_agent->str);
+  g_string_free (user_agent, TRUE);
+  user_agent = NULL;
 
   if (!src->keep_alive) {
     _soup_message_headers_append (request_headers, "Connection", "close");

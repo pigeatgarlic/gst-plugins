@@ -1,6 +1,6 @@
 project('gstreamer-full', 'c',
   version : '1.23.0.1',
-  meson_version : '>= 0.62.0',
+  meson_version : '>= 0.63.0',
   default_options : ['buildtype=debugoptimized',
                      # Needed due to https://github.com/mesonbuild/meson/issues/1889,
                      # but this can cause problems in the future. Remove it
@@ -33,12 +33,12 @@ endif
 # Install gst-indent pre-commit hook
 run_command(python3, '-c', 'import shutil; shutil.copy("scripts/git-hooks/multi-pre-commit.hook", ".git/hooks/pre-commit")', check: false)
 
-
-gitlint = find_program('gitlint', required: false)
+gitlint_req = '>= 0.18'
+gitlint = find_program('gitlint', version: gitlint_req, required: false)
 if gitlint.found()
   run_command(gitlint, 'install-hook', check: false)
 else
-  message('gitlint not found, please install it with your package manager or `python3 -m pip install gitlint` to enable the commit message hook')
+  message('gitlint not found or too old, please install it with your package manager or `python3 -m pip install gitlint` to enable the commit message hook')
 endif
 
 # On macOS, you have to run "Install Certificates.command" otherwise Python
@@ -105,7 +105,6 @@ subprojects = [
   ['gst-integration-testsuites', { 'option': get_option('devtools') }],
   ['gst-editing-services', { 'option': get_option('ges'), 'build-hotdoc': true}],
   ['gstreamer-vaapi', { 'option': get_option('vaapi'), 'build-hotdoc': true}],
-  ['gst-omx', { 'option': get_option('omx'), 'build-hotdoc': true}],
   ['gstreamer-sharp', { 'option': get_option('sharp') }],
   ['pygobject', { 'option': get_option('python'), 'match_gst_version': false, 'sysdep': 'pygobject-3.0', 'sysdep_version': '>= 3.8' }],
   ['gst-python', { 'option': get_option('python')}],
@@ -117,8 +116,16 @@ if get_option('build-tools-source') == 'subproject'
   if build_system == 'windows'
     subproject('win-flex-bison-binaries')
     subproject('win-nasm')
+    subproject('win-pkgconfig')
   elif build_system == 'darwin'
     subproject('macos-bison-binary')
+    # Newer macOS provides /usr/lib/pkgconfig/libpcre2-8.pc which is broken
+    # because it says headers are in /usr/include but that directory doesn't
+    # exist. It can only be used to find the library, which only exists on
+    # newer macOS at /usr/lib/libpcre2-8.dylib, so it's also unusable.
+    #
+    # jit support requires macOS 11.0 or newer, so disable it by default
+    subproject('pcre2', default_options: ['default_library=static', 'jit=disabled'])
   endif
 endif
 
@@ -393,6 +400,10 @@ if building_full
   # glib and gobject are part of our public API. If we are using glib from the
   # system then our pkg-config file must require it. If we built it as
   # subproject then we need to link_whole it.
+  # Note that link_whole dependencies aren't exposed transitively in
+  # Windows/Cygwin, because symbols from static libraries must
+  # be manually marked as exported through a module definition file.
+  # See e.g. https://github.com/FFmpeg/FFmpeg/blob/3057ce797f6e1348b978f5ffe9e2afd2224544f0/configure#L5726
   glib_deps = []
   glib_dep = dependency('glib-2.0')
   gobject_dep = dependency('gobject-2.0')
@@ -430,6 +441,7 @@ if building_full
   # Build shared library
   gstfull = build_target('gstreamer-full-1.0',
     init_static_plugins_c,
+    c_args: ['-DBUILDING_GST'],
     target_type: get_option('gst-full-target-type'),
     link_args: gstfull_link_args,
     link_whole : exposed_libs,
@@ -438,11 +450,18 @@ if building_full
     install : true,
   )
   gst_full_c_flags =  []
-  if building_full_static
+  if building_full_static or get_option('default_library') == 'static'
     gst_full_c_flags += ['-DGST_STATIC_COMPILATION']
   endif
 
-  gst_full_dep = declare_dependency(link_with: gstfull,
+  gst_full_libs = [gstfull]
+
+  # See above re: symbol exports in Win32
+  if ['windows', 'cygwin'].contains(host_machine.system())
+    gst_full_libs += exposed_libs
+  endif
+
+  gst_full_dep = declare_dependency(link_with: gst_full_libs,
     compile_args: gst_full_c_flags,
     dependencies : incdir_deps + glib_deps,
     include_directories: include_directories('.')
