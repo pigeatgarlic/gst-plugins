@@ -58,7 +58,6 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* we include this here to get the G_OS_* defines */
 #include <glib.h>
@@ -360,6 +359,26 @@ socket_client_event (GSocketClient * client, GSocketClientEvent event,
 
     g_tls_connection_set_interaction (connection, rtspconn->tls_interaction);
   }
+}
+
+static void
+stream0_reset (GstRTSPConnection * conn)
+{
+  if (conn->stream0) {
+    g_object_unref (conn->stream0);
+    conn->stream0 = NULL;
+    conn->socket0 = NULL;
+  }
+  conn->input_stream = NULL;
+  conn->output_stream = NULL;
+  g_free (conn->remote_ip);
+
+  conn->remote_ip = NULL;
+  conn->read_socket = NULL;
+  conn->write_socket = NULL;
+  conn->read_socket_used = FALSE;
+  conn->write_socket_used = FALSE;
+  conn->control_stream = NULL;
 }
 
 /* transfer full */
@@ -892,7 +911,7 @@ add_extra_headers (GstRTSPMessage * msg, GArray * headers)
 }
 
 static GstRTSPResult
-setup_tunneling (GstRTSPConnection * conn, gint64 timeout, gchar * uri,
+setup_tunneling (GstRTSPConnection * conn, gint64 timeout, gchar ** req_uri,
     GstRTSPMessage * response)
 {
   gint i;
@@ -909,6 +928,10 @@ setup_tunneling (GstRTSPConnection * conn, gint64 timeout, gchar * uri,
   gchar *request_uri = NULL;
   gchar *host = NULL;
   GCancellable *cancellable;
+  gchar *uri;
+
+  g_return_val_if_fail (req_uri != NULL, GST_RTSP_EINVAL);
+  uri = *req_uri;
 
   url = conn->url;
 
@@ -952,9 +975,34 @@ setup_tunneling (GstRTSPConnection * conn, gint64 timeout, gchar * uri,
       read_failed);
   conn->manual_http = old_http;
 
-  if (response->type != GST_RTSP_MESSAGE_HTTP_RESPONSE ||
-      response->type_data.response.code != GST_RTSP_STS_OK)
+  if (response->type != GST_RTSP_MESSAGE_HTTP_RESPONSE)
     goto wrong_result;
+
+  switch (response->type_data.response.code) {
+    case GST_RTSP_STS_OK:
+      break;
+    case GST_RTSP_STS_MOVED_PERMANENTLY:
+    case GST_RTSP_STS_MOVE_TEMPORARILY:
+    case GST_RTSP_STS_REDIRECT_TEMPORARILY:
+    case GST_RTSP_STS_REDIRECT_PERMANENTLY:
+    {
+      gchar *location_val = NULL;
+      gst_rtsp_message_get_header (response, GST_RTSP_HDR_LOCATION,
+          &location_val, 0);
+
+      if (location_val != NULL) {
+        GST_TRACE ("redirect (%d) to %s",
+            response->type_data.response.code, location_val);
+        g_free (uri);
+        uri = g_strdup (location_val);
+        *req_uri = uri;
+        res = GST_RTSP_OK_REDIRECT;
+        goto exit;
+      }
+    }
+    default:
+      goto wrong_result;
+  }
 
   if (!conn->ignore_x_server_reply &&
       gst_rtsp_message_get_header (response, GST_RTSP_HDR_X_SERVER_IP_ADDRESS,
@@ -1102,15 +1150,17 @@ GstRTSPResult
 gst_rtsp_connection_connect_with_response_usec (GstRTSPConnection * conn,
     gint64 timeout, GstRTSPMessage * response)
 {
-  GstRTSPResult res;
+  GstRTSPResult res = GST_RTSP_OK;
   GSocketConnection *connection;
   GSocket *socket;
   GError *error = NULL;
-  gchar *connection_uri, *request_uri, *remote_ip;
+  gchar *connection_uri, *request_uri, *remote_ip, *query = NULL, *path = NULL;
   GstClockTime to;
   guint16 url_port;
   GstRTSPUrl *url;
   GCancellable *cancellable;
+  guint redirect_cnt = 0;
+  GstUri *uri = NULL;
 
   g_return_val_if_fail (conn != NULL, GST_RTSP_EINVAL);
   g_return_val_if_fail (conn->url != NULL, GST_RTSP_EINVAL);
@@ -1130,54 +1180,110 @@ gst_rtsp_connection_connect_with_response_usec (GstRTSPConnection * conn,
     connection_uri = gst_rtsp_url_get_request_uri (url);
   }
 
-  cancellable = get_cancellable (conn);
+  while (res == GST_RTSP_OK) {
+    cancellable = get_cancellable (conn);
 
-  if (conn->proxy_host) {
-    connection = g_socket_client_connect_to_host (conn->client,
-        conn->proxy_host, conn->proxy_port, cancellable, &error);
-    request_uri = g_strdup (connection_uri);
-  } else {
-    connection = g_socket_client_connect_to_uri (conn->client,
-        connection_uri, url_port, cancellable, &error);
+    if (conn->proxy_host) {
+      connection = g_socket_client_connect_to_host (conn->client,
+          conn->proxy_host, conn->proxy_port, cancellable, &error);
+      request_uri = g_strdup (connection_uri);
+    } else {
+      if (uri != NULL) {
+        url_port = gst_uri_get_port (uri);
+      }
+      connection = g_socket_client_connect_to_uri (conn->client,
+          connection_uri, url_port, cancellable, &error);
 
-    /* use the relative component of the uri for non-proxy connections */
-    request_uri = g_strdup_printf ("%s%s%s", url->abspath,
-        url->query ? "?" : "", url->query ? url->query : "");
-  }
+      if (uri == NULL) {
+        /* Use the relative component of the uri for non-proxy connections.
+         * Note: request_uri is not a complete URI, it only contain path +
+         * query.*/
+        request_uri = g_strdup_printf ("%s%s%s", url->abspath,
+            url->query ? "?" : "", url->query ? url->query : "");
+      } else {
+        path = gst_uri_get_path (uri);
+        query = gst_uri_get_query_string (uri);
+        request_uri = g_strdup_printf ("%s%s%s",
+            path, query ? "?" : "", query ? query : "");
+      }
+      g_free (path);
+      g_free (query);
+    }
 
-  g_clear_object (&cancellable);
+    g_clear_object (&cancellable);
 
-  if (connection == NULL)
-    goto connect_failed;
+    if (connection == NULL)
+      goto connect_failed;
 
-  /* get remote address */
-  socket = g_socket_connection_get_socket (connection);
+    /* get remote address */
+    socket = g_socket_connection_get_socket (connection);
 
-  if (!collect_addresses (socket, &remote_ip, NULL, TRUE, &error))
-    goto remote_address_failed;
+    if (!collect_addresses (socket, &remote_ip, NULL, TRUE, &error))
+      goto remote_address_failed;
 
-  g_free (conn->remote_ip);
-  conn->remote_ip = remote_ip;
-  conn->stream0 = G_IO_STREAM (connection);
-  conn->socket0 = socket;
-  /* this is our read socket */
-  conn->read_socket = conn->socket0;
-  conn->write_socket = conn->socket0;
-  conn->read_socket_used = FALSE;
-  conn->write_socket_used = FALSE;
-  conn->input_stream = g_io_stream_get_input_stream (conn->stream0);
-  conn->output_stream = g_io_stream_get_output_stream (conn->stream0);
-  conn->control_stream = NULL;
+    g_free (conn->remote_ip);
+    conn->remote_ip = remote_ip;
+    conn->stream0 = G_IO_STREAM (connection);
+    conn->socket0 = socket;
+    /* this is our read socket */
+    conn->read_socket = conn->socket0;
+    conn->write_socket = conn->socket0;
+    conn->read_socket_used = FALSE;
+    conn->write_socket_used = FALSE;
+    conn->input_stream = g_io_stream_get_input_stream (conn->stream0);
+    conn->output_stream = g_io_stream_get_output_stream (conn->stream0);
+    conn->control_stream = NULL;
 
-  if (conn->tunneled) {
-    res = setup_tunneling (conn, timeout, request_uri, response);
-    if (res != GST_RTSP_OK)
-      goto tunneling_failed;
+    if (conn->tunneled) {
+      res = setup_tunneling (conn, timeout, &request_uri, response);
+      if (res != GST_RTSP_OK) {
+        if (res == GST_RTSP_OK_REDIRECT) {
+          if (conn->proxy_host) {
+            GST_TRACE ("redirect behind proxy is not supported");
+            res = GST_RTSP_ERROR;
+            goto tunneling_failed;
+          }
+
+          GST_LOG ("redirect from %s to %s.", connection_uri, request_uri);
+
+          stream0_reset (conn);
+          connection_uri = request_uri;
+          gst_uri_unref (uri);
+
+          uri = gst_uri_from_string (connection_uri);
+          if (uri == NULL) {
+            GST_TRACE ("failed to parse redirect uri");
+            res = GST_RTSP_ERROR;
+            goto tunneling_failed;
+          }
+
+          conn->url->abspath = gst_uri_get_path (uri);
+          conn->url->host = g_strdup (gst_uri_get_host (uri));
+          conn->url->port = gst_uri_get_port (uri);
+          conn->url->query = gst_uri_get_query_string (uri);
+          res = GST_RTSP_OK;
+
+          /* at most allow 5 redirect */
+          if (redirect_cnt++ > 4) {
+            GST_TRACE ("redirect max reached");
+            res = GST_RTSP_ERROR;
+            goto tunneling_failed;
+          }
+        } else {
+          goto tunneling_failed;
+        }
+      } else {
+        /* Caller must be informed */
+        res = GST_RTSP_OK_REDIRECT;
+      }
+    } else {
+      break;
+    }
   }
   g_free (connection_uri);
   g_free (request_uri);
 
-  return GST_RTSP_OK;
+  return res;
 
   /* ERRORS */
 connect_failed:
@@ -1324,20 +1430,17 @@ gen_date_string (gchar * date_string, guint len)
       { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
     "Nov", "Dec"
   };
-  struct tm tm;
-  time_t t;
+  GDateTime *now;
 
-  time (&t);
+  now = g_date_time_new_now_utc ();
 
-#ifdef HAVE_GMTIME_R
-  gmtime_r (&t, &tm);
-#else
-  tm = *gmtime (&t);
-#endif
+  g_snprintf (date_string, len, "%s, %02u %s %04u %02u:%02u:%02u GMT",
+      wkdays[g_date_time_get_day_of_week (now)],
+      g_date_time_get_day_of_month (now), months[g_date_time_get_month (now)],
+      g_date_time_get_year (now), g_date_time_get_hour (now),
+      g_date_time_get_minute (now), g_date_time_get_second (now));
 
-  g_snprintf (date_string, len, "%s, %02d %s %04d %02d:%02d:%02d GMT",
-      wkdays[tm.tm_wday], tm.tm_mday, months[tm.tm_mon], tm.tm_year + 1900,
-      tm.tm_hour, tm.tm_min, tm.tm_sec);
+  g_date_time_unref (now);
 }
 
 static GstRTSPResult
@@ -1569,6 +1672,9 @@ read_bytes (GstRTSPConnection * conn, guint8 * buffer, guint * idx, guint size,
   if (G_UNLIKELY (*idx > size))
     return GST_RTSP_ERROR;
 
+  if (G_UNLIKELY (!conn->input_stream))
+    return GST_RTSP_EINVAL;
+
   left = size - *idx;
 
   while (left) {
@@ -1586,6 +1692,9 @@ error:
   {
     if (G_UNLIKELY (r == 0))
       return GST_RTSP_EEOF;
+
+    if (G_UNLIKELY (!err))
+      return GST_RTSP_EINVAL;
 
     GST_DEBUG ("%s", err->message);
     res = gst_rtsp_result_from_g_io_error (err, GST_RTSP_ESYS);
@@ -3846,7 +3955,7 @@ struct _GstRTSPWatch
   /* queued message for transmission */
   guint id;
   GMutex mutex;
-  GstQueueArray *messages;
+  GstVecDeque *messages;
   gsize messages_bytes;
   guint messages_count;
 
@@ -4114,7 +4223,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
 
   g_mutex_lock (&watch->mutex);
   do {
-    guint n_messages = gst_queue_array_get_length (watch->messages);
+    guint n_messages = gst_vec_deque_get_length (watch->messages);
     GOutputVector *vectors;
     GstMapInfo *map_infos;
     guint *ids;
@@ -4159,7 +4268,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
     }
 
     for (i = 0, n_vectors = 0, n_memories = 0, n_ids = 0; i < n_messages; i++) {
-      msg = gst_queue_array_peek_nth_struct (watch->messages, i);
+      msg = gst_vec_deque_peek_nth_struct (watch->messages, i);
       if (msg->id != 0)
         n_ids++;
 
@@ -4197,7 +4306,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
 
     for (i = 0, j = 0, n_mmap = 0, l = 0, bytes_to_write = 0; i < n_messages;
         i++) {
-      msg = gst_queue_array_peek_nth_struct (watch->messages, i);
+      msg = gst_vec_deque_peek_nth_struct (watch->messages, i);
 
       if (msg->data_offset < msg->data_size) {
         vectors[j].buffer = (msg->data_is_data_header ?
@@ -4267,7 +4376,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
     if (bytes_written == bytes_to_write) {
       /* fast path, just unmap all memories, free memory, drop all messages and notify them */
       l = 0;
-      while ((msg = gst_queue_array_pop_head_struct (watch->messages))) {
+      while ((msg = gst_vec_deque_pop_head_struct (watch->messages))) {
         if (msg->id) {
           ids[l] = msg->id;
           l++;
@@ -4281,7 +4390,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
     } else if (bytes_written > 0) {
       /* not done, let's skip all messages that were sent already and free them */
       for (i = 0, drop_messages = 0; i < n_messages; i++) {
-        msg = gst_queue_array_peek_nth_struct (watch->messages, i);
+        msg = gst_vec_deque_peek_nth_struct (watch->messages, i);
 
         if (bytes_written >= msg->data_size - msg->data_offset) {
           guint body_size;
@@ -4327,7 +4436,7 @@ gst_rtsp_source_dispatch_write (GPollableOutputStream * stream,
       }
 
       while (drop_messages > 0) {
-        msg = gst_queue_array_pop_head_struct (watch->messages);
+        msg = gst_vec_deque_pop_head_struct (watch->messages);
         g_assert (msg);
         drop_messages--;
       }
@@ -4375,10 +4484,10 @@ write_error:
     if (watch->funcs.error_full) {
       guint i, n_messages;
 
-      n_messages = gst_queue_array_get_length (watch->messages);
+      n_messages = gst_vec_deque_get_length (watch->messages);
       for (i = 0; i < n_messages; i++) {
         GstRTSPSerializedMessage *msg =
-            gst_queue_array_peek_nth_struct (watch->messages, i);
+            gst_vec_deque_peek_nth_struct (watch->messages, i);
         if (msg->id)
           watch->funcs.error_full (watch, res, NULL, msg->id, watch->user_data);
       }
@@ -4402,10 +4511,10 @@ gst_rtsp_source_finalize (GSource * source)
   build_reset (&watch->builder);
   gst_rtsp_message_unset (&watch->message);
 
-  while ((msg = gst_queue_array_pop_head_struct (watch->messages))) {
+  while ((msg = gst_vec_deque_pop_head_struct (watch->messages))) {
     gst_rtsp_serialized_message_clear (msg);
   }
-  gst_queue_array_free (watch->messages);
+  gst_vec_deque_free (watch->messages);
   watch->messages = NULL;
   watch->messages_bytes = 0;
   watch->messages_count = 0;
@@ -4468,7 +4577,7 @@ gst_rtsp_watch_new (GstRTSPConnection * conn,
 
   g_mutex_init (&result->mutex);
   result->messages =
-      gst_queue_array_new_for_struct (sizeof (GstRTSPSerializedMessage), 10);
+      gst_vec_deque_new_for_struct (sizeof (GstRTSPSerializedMessage), 10);
   g_cond_init (&result->queue_not_full);
 
   gst_rtsp_watch_reset (result);
@@ -4643,7 +4752,7 @@ gst_rtsp_watch_write_serialized_messages (GstRTSPWatch * watch,
     goto flushing;
 
   /* try to send the message synchronously first */
-  if (gst_queue_array_get_length (watch->messages) == 0) {
+  if (gst_vec_deque_get_length (watch->messages) == 0) {
     gint j, k;
     GOutputVector *vectors;
     GstMapInfo *map_infos;
@@ -4800,7 +4909,7 @@ gst_rtsp_watch_write_serialized_messages (GstRTSPWatch * watch,
     }
 
     /* add the record to a queue. */
-    gst_queue_array_push_tail_struct (watch->messages, &local_message);
+    gst_vec_deque_push_tail_struct (watch->messages, &local_message);
     watch->messages_bytes +=
         (local_message.data_size - local_message.data_offset);
     if (local_message.body_data)
@@ -5067,7 +5176,7 @@ gst_rtsp_watch_set_flushing (GstRTSPWatch * watch, gboolean flushing)
   if (flushing) {
     GstRTSPSerializedMessage *msg;
 
-    while ((msg = gst_queue_array_pop_head_struct (watch->messages))) {
+    while ((msg = gst_vec_deque_pop_head_struct (watch->messages))) {
       gst_rtsp_serialized_message_clear (msg);
     }
   }

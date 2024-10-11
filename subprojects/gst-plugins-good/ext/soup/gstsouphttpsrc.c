@@ -940,10 +940,11 @@ gst_soup_http_src_add_range_header (GstSoupHTTPSrc * src, guint64 offset,
 }
 
 static gboolean
-_append_extra_header (GQuark field_id, const GValue * value, gpointer user_data)
+_append_extra_header (const GstIdStr * fieldname, const GValue * value,
+    gpointer user_data)
 {
   GstSoupHTTPSrc *src = GST_SOUP_HTTP_SRC (user_data);
-  const gchar *field_name = g_quark_to_string (field_id);
+  const gchar *field_name = gst_id_str_as_str (fieldname);
   gchar *field_content = NULL;
   SoupMessageHeaders *request_headers =
       _soup_message_get_request_headers (src->msg);
@@ -975,7 +976,7 @@ _append_extra_header (GQuark field_id, const GValue * value, gpointer user_data)
 }
 
 static gboolean
-_append_extra_headers (GQuark field_id, const GValue * value,
+_append_extra_headers (const GstIdStr * fieldname, const GValue * value,
     gpointer user_data)
 {
   if (G_VALUE_TYPE (value) == GST_TYPE_ARRAY) {
@@ -985,7 +986,7 @@ _append_extra_headers (GQuark field_id, const GValue * value,
     for (i = 0; i < n; i++) {
       const GValue *v = gst_value_array_get_value (value, i);
 
-      if (!_append_extra_header (field_id, v, user_data))
+      if (!_append_extra_header (fieldname, v, user_data))
         return FALSE;
     }
   } else if (G_VALUE_TYPE (value) == GST_TYPE_LIST) {
@@ -995,11 +996,11 @@ _append_extra_headers (GQuark field_id, const GValue * value,
     for (i = 0; i < n; i++) {
       const GValue *v = gst_value_list_get_value (value, i);
 
-      if (!_append_extra_header (field_id, v, user_data))
+      if (!_append_extra_header (fieldname, v, user_data))
         return FALSE;
     }
   } else {
-    return _append_extra_header (field_id, value, user_data);
+    return _append_extra_header (fieldname, value, user_data);
   }
 
   return TRUE;
@@ -1012,7 +1013,8 @@ gst_soup_http_src_add_extra_headers (GstSoupHTTPSrc * src)
   if (!src->extra_headers)
     return TRUE;
 
-  return gst_structure_foreach (src->extra_headers, _append_extra_headers, src);
+  return gst_structure_foreach_id_str (src->extra_headers,
+      _append_extra_headers, src);
 }
 
 static gpointer
@@ -1049,11 +1051,11 @@ thread_func (gpointer user_data)
           NULL);
       g_object_unref (proxy_resolver);
     }
-#if !defined(STATIC_SOUP) || STATIC_SOUP == 2
+#if !defined(LINK_SOUP) || LINK_SOUP == 2
   } else {
     g_object_set (session->session, "ssl-strict", src->ssl_strict, NULL);
     if (src->proxy != NULL) {
-      /* Need #if because there's no proxy->soup_uri when STATIC_SOUP == 3 */
+      /* Need #if because there's no proxy->soup_uri when LINK_SOUP == 3 */
       g_object_set (session->session, "proxy-uri", src->proxy->soup_uri, NULL);
     }
 #endif
@@ -1202,7 +1204,7 @@ gst_soup_http_src_session_open (GstSoupHTTPSrc * src)
     /* now owned by the loop */
     g_main_context_unref (ctx);
 
-    src->session->thread = g_thread_try_new ("souphttpsrc-thread",
+    src->session->thread = g_thread_try_new ("souphttpsrc",
         thread_func, src, NULL);
 
     if (!src->session->thread) {
@@ -1655,7 +1657,7 @@ gst_soup_http_src_parse_status (SoupMessage * msg, GstSoupHTTPSrc * src)
   }
 
   /* SOUP_STATUS_IS_TRANSPORT_ERROR was replaced with GError in libsoup-3.0 */
-#if !defined(STATIC_SOUP) || STATIC_SOUP == 2
+#if !defined(LINK_SOUP) || LINK_SOUP == 2
   if (SOUP_STATUS_IS_TRANSPORT_ERROR (status_code)) {
     switch (status_code) {
       case SOUP_STATUS_CANT_RESOLVE:
@@ -1816,7 +1818,7 @@ gst_soup_http_src_build_message (GstSoupHTTPSrc * src, const gchar * method)
     /* SOUP_MESSAGE_OVERWRITE_CHUNKS is gone in libsoup-3.0, and
      * soup_message_body_set_accumulate() requires SoupMessageBody, which
      * can only be fetched from SoupServerMessage, not SoupMessage */
-#if !defined(STATIC_SOUP) || STATIC_SOUP == 2
+#if !defined(LINK_SOUP) || LINK_SOUP == 2
     if (gst_soup_loader_get_api_version () == 2)
       flags |= SOUP_MESSAGE_OVERWRITE_CHUNKS;
 #endif

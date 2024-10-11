@@ -23,8 +23,7 @@
 #include <gst/video/video.h>
 #include <gst/codecs/gstcodecpicture.h>
 #include <gst/dxva/gstdxva.h>
-#include <gst/d3d11/gstd3d11.h>
-#include "gstd3d12_fwd.h"
+#include "gstd3d12pluginutils.h"
 
 G_BEGIN_DECLS
 
@@ -32,14 +31,21 @@ G_BEGIN_DECLS
 G_DECLARE_FINAL_TYPE (GstD3D12Decoder,
     gst_d3d12_decoder, GST, D3D12_DECODER, GstObject);
 
-typedef struct _GstD3D12DecoderClassData GstD3D12DecoderClassData;
-
 struct GstD3D12DecoderSubClassData
 {
   GstDxvaCodec codec;
   gint64 adapter_luid;
   guint device_id;
   guint vendor_id;
+  gboolean d3d11_interop;
+};
+
+struct GstD3D12DecoderClassData
+{
+  GstD3D12DecoderSubClassData subclass_data;
+  GstCaps *sink_caps;
+  GstCaps *src_caps;
+  gchar *description;
 };
 
 #define GST_D3D12_DECODER_DEFINE_TYPE(ModuleObjName,module_obj_name,MODULE,OBJ_NAME,ParentName) \
@@ -64,6 +70,7 @@ struct GstD3D12DecoderSubClassData
   static void module_obj_name##_set_context (GstElement * element, \
       GstContext * context); \
   static gboolean module_obj_name##_open (GstVideoDecoder * decoder); \
+  static gboolean module_obj_name##_stop (GstVideoDecoder * decoder); \
   static gboolean module_obj_name##_close (GstVideoDecoder * decoder); \
   static gboolean module_obj_name##_negotiate (GstVideoDecoder * decoder); \
   static gboolean module_obj_name##_decide_allocation (GstVideoDecoder * decoder, \
@@ -74,6 +81,9 @@ struct GstD3D12DecoderSubClassData
       GstQuery * query); \
   static gboolean module_obj_name##_sink_event (GstVideoDecoder * decoder, \
       GstEvent * event); \
+  static GstFlowReturn module_obj_name##_drain (GstVideoDecoder * decoder); \
+  static GstFlowReturn module_obj_name##_finish (GstVideoDecoder * decoder); \
+  static gboolean module_obj_name##_flush (GstVideoDecoder * decoder); \
   static GstFlowReturn module_obj_name##_configure (ParentName * decoder, \
       GstVideoCodecState * input_state, const GstVideoInfo * info, \
       gint crop_x, gint crop_y, \
@@ -97,8 +107,7 @@ struct GstD3D12DecoderSubClassData
   static GstFlowReturn  module_obj_name##_duplicate_picture (ParentName * decoder, \
       GstCodecPicture * src, GstCodecPicture * dst);
 
-GstD3D12Decoder * gst_d3d12_decoder_new               (GstDxvaCodec codec,
-                                                       gint64 adapter_luid);
+GstD3D12Decoder * gst_d3d12_decoder_new               (const GstD3D12DecoderSubClassData * cdata);
 
 gboolean          gst_d3d12_decoder_open              (GstD3D12Decoder * decoder,
                                                        GstElement * element);
@@ -106,6 +115,7 @@ gboolean          gst_d3d12_decoder_open              (GstD3D12Decoder * decoder
 gboolean          gst_d3d12_decoder_close             (GstD3D12Decoder * decoder);
 
 GstFlowReturn     gst_d3d12_decoder_configure         (GstD3D12Decoder * decoder,
+                                                       GstVideoDecoder * videodec,
                                                        GstVideoCodecState * input_state,
                                                        const GstVideoInfo * info,
                                                        gint crop_x,
@@ -114,9 +124,23 @@ GstFlowReturn     gst_d3d12_decoder_configure         (GstD3D12Decoder * decoder
                                                        gint coded_height,
                                                        guint dpb_size);
 
+GstFlowReturn     gst_d3d12_decoder_drain             (GstD3D12Decoder * decoder,
+                                                       GstVideoDecoder * videodec);
+
+gboolean          gst_d3d12_decoder_flush             (GstD3D12Decoder * decoder,
+                                                       GstVideoDecoder * videodec);
+
+gboolean          gst_d3d12_decoder_stop              (GstD3D12Decoder * decoder);
+
 GstFlowReturn     gst_d3d12_decoder_new_picture   (GstD3D12Decoder * decoder,
                                                    GstVideoDecoder * videodec,
                                                    GstCodecPicture * picture);
+
+GstFlowReturn     gst_d3d12_decoder_new_picture_with_size (GstD3D12Decoder * decoder,
+                                                           GstVideoDecoder * videodec,
+                                                           GstCodecPicture * picture,
+                                                           guint width,
+                                                           guint height);
 
 GstFlowReturn     gst_d3d12_decoder_duplicate_picture (GstD3D12Decoder * decoder,
                                                        GstCodecPicture * src,
@@ -163,8 +187,7 @@ gboolean          gst_d3d12_decoder_handle_query      (GstD3D12Decoder * decoder
 /* Utils for element registration */
 GstD3D12DecoderClassData * gst_d3d12_decoder_check_feature_support   (GstD3D12Device * device,
                                                                       ID3D12VideoDevice * video_device,
-                                                                      GstDxvaCodec codec,
-                                                                      gboolean d3d11_interop);
+                                                                      GstDxvaCodec codec);
 
 void  gst_d3d12_decoder_class_data_fill_subclass_data (GstD3D12DecoderClassData * data,
                                                        GstD3D12DecoderSubClassData * subclass_data);

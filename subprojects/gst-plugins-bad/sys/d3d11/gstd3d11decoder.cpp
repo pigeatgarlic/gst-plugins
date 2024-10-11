@@ -450,9 +450,7 @@ gst_d3d11_decoder_prepare_output_view_pool (GstD3D11Decoder * self)
     gst_clear_object (&self->internal_pool);
   }
 
-  if (!self->use_array_of_texture) {
-    alloc_flags = GST_D3D11_ALLOCATION_FLAG_TEXTURE_ARRAY;
-  } else {
+  if (self->use_array_of_texture) {
     /* array of texture can have shader resource view */
     bind_flags |= D3D11_BIND_SHADER_RESOURCE;
   }
@@ -472,7 +470,7 @@ gst_d3d11_decoder_prepare_output_view_pool (GstD3D11Decoder * self)
       self->downstream_min_buffers);
 
   if (!self->use_array_of_texture) {
-    alloc_params->desc[0].ArraySize = pool_size;
+    gst_d3d11_allocation_params_set_array_size (alloc_params, pool_size);
   } else {
     self->next_view_id = 0;
 
@@ -1553,6 +1551,7 @@ gst_d3d11_decoder_output_picture (GstD3D11Decoder * decoder,
 {
   GstFlowReturn ret = GST_FLOW_OK;
   GstBuffer *view_buffer;
+  bool attach_crop_meta = false;
 
   if (picture->discont_state) {
     g_clear_pointer (&decoder->input_state, gst_video_codec_state_unref);
@@ -1595,21 +1594,8 @@ gst_d3d11_decoder_output_picture (GstD3D11Decoder * decoder,
     mem = gst_buffer_peek_memory (view_buffer, 0);
     GST_MINI_OBJECT_FLAG_SET (mem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
 
-    if (decoder->need_crop) {
-      GstVideoCropMeta *crop_meta;
-
-      view_buffer = gst_buffer_make_writable (view_buffer);
-      crop_meta = gst_buffer_get_video_crop_meta (view_buffer);
-      if (!crop_meta)
-        crop_meta = gst_buffer_add_video_crop_meta (view_buffer);
-
-      crop_meta->x = decoder->offset_x;
-      crop_meta->y = decoder->offset_y;
-      crop_meta->width = decoder->info.width;
-      crop_meta->height = decoder->info.height;
-
-      GST_TRACE_OBJECT (decoder, "Attatching crop meta");
-    }
+    if (decoder->need_crop)
+      attach_crop_meta = true;
 
     frame->output_buffer = gst_buffer_ref (view_buffer);
   } else {
@@ -1629,6 +1615,18 @@ gst_d3d11_decoder_output_picture (GstD3D11Decoder * decoder,
 
   GST_BUFFER_FLAG_SET (frame->output_buffer, buffer_flags);
   gst_codec_picture_unref (picture);
+
+  if (attach_crop_meta) {
+    frame->output_buffer = gst_buffer_make_writable (frame->output_buffer);
+
+    auto crop_meta = gst_buffer_add_video_crop_meta (frame->output_buffer);
+    crop_meta->x = decoder->offset_x;
+    crop_meta->y = decoder->offset_y;
+    crop_meta->width = decoder->info.width;
+    crop_meta->height = decoder->info.height;
+
+    GST_TRACE_OBJECT (decoder, "Attatching crop meta");
+  }
 
   return gst_video_decoder_finish_frame (videodec, frame);
 
@@ -1771,7 +1769,8 @@ gst_d3d11_decoder_negotiate (GstD3D11Decoder * decoder,
 
   if (d3d11_supported) {
     gst_caps_set_features (state->caps, 0,
-        gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, NULL));
+        gst_caps_features_new_static_str (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY,
+            NULL));
   }
 
   decoder->downstream_supports_d3d11 = d3d11_supported;
@@ -1877,7 +1876,8 @@ gst_d3d11_decoder_decide_allocation (GstD3D11Decoder * decoder,
      * output of shader pipeline if internal resizing is required.
      * Also, downstream can keep using video processor even if we copy
      * some decoded textures into downstream buffer */
-    d3d11_params->desc[0].BindFlags |= D3D11_BIND_RENDER_TARGET;
+    gst_d3d11_allocation_params_set_bind_flags (d3d11_params,
+        D3D11_BIND_RENDER_TARGET);
 
     gst_buffer_pool_config_set_d3d11_allocation_params (config, d3d11_params);
     gst_d3d11_allocation_params_free (d3d11_params);

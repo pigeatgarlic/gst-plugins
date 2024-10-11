@@ -111,7 +111,7 @@ gst_v4l2_video_enc_open (GstVideoEncoder * encoder)
 {
   GstV4l2VideoEnc *self = GST_V4L2_VIDEO_ENC (encoder);
   GstV4l2Error error = GST_V4L2_ERROR_INIT;
-  GstCaps *codec_caps;
+  GstCaps *tmp_caps, *codec_caps;
 
   GST_DEBUG_OBJECT (self, "Opening");
 
@@ -123,6 +123,15 @@ gst_v4l2_video_enc_open (GstVideoEncoder * encoder)
 
   self->probed_sinkcaps = gst_v4l2_object_probe_caps (self->v4l2output,
       gst_v4l2_object_get_raw_caps ());
+
+  /*
+   * Relax the framerate to always allow 0/1 regardless of what the driver
+   * wants. This improve compatibility of the encoder with sources which may
+   * not know the frame rate
+   */
+  tmp_caps = gst_caps_copy (self->probed_sinkcaps);
+  gst_caps_set_simple (tmp_caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+  gst_caps_append (self->probed_sinkcaps, tmp_caps);
 
   if (gst_caps_is_empty (self->probed_sinkcaps))
     goto no_raw_format;
@@ -213,7 +222,6 @@ gst_v4l2_video_enc_stop (GstVideoEncoder * encoder)
 
   /* Should have been flushed already */
   g_assert (g_atomic_int_get (&self->active) == FALSE);
-  g_assert (g_atomic_int_get (&self->processing) == FALSE);
 
   gst_v4l2_object_stop (self->v4l2output);
   gst_v4l2_object_stop (self->v4l2capture);
@@ -307,19 +315,6 @@ gst_v4l2_video_enc_flush (GstVideoEncoder * encoder)
   GstV4l2VideoEnc *self = GST_V4L2_VIDEO_ENC (encoder);
 
   GST_DEBUG_OBJECT (self, "Flushing");
-
-  /* Ensure the processing thread has stopped for the reverse playback
-   * iscount case */
-  if (g_atomic_int_get (&self->processing)) {
-    GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
-
-    gst_v4l2_object_unlock_stop (self->v4l2output);
-    gst_v4l2_object_unlock_stop (self->v4l2capture);
-    gst_pad_stop_task (encoder->srcpad);
-
-    GST_VIDEO_ENCODER_STREAM_UNLOCK (encoder);
-
-  }
 
   self->output_flow = GST_FLOW_OK;
 
@@ -735,7 +730,6 @@ beach:
 
   gst_buffer_replace (&buffer, NULL);
   self->output_flow = ret;
-  g_atomic_int_set (&self->processing, FALSE);
   gst_v4l2_object_unlock (self->v4l2output);
   gst_pad_pause_task (encoder->srcpad);
 }
@@ -743,12 +737,6 @@ beach:
 static void
 gst_v4l2_video_enc_loop_stopped (GstV4l2VideoEnc * self)
 {
-  if (g_atomic_int_get (&self->processing)) {
-    GST_DEBUG_OBJECT (self, "Early stop of encoding thread");
-    self->output_flow = GST_FLOW_FLUSHING;
-    g_atomic_int_set (&self->processing, FALSE);
-  }
-
   GST_DEBUG_OBJECT (self, "Encoding task destroyed: %s",
       gst_flow_get_name (self->output_flow));
 
@@ -763,15 +751,13 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
   GstTaskState task_state;
   gboolean active;
 
-  GST_DEBUG_OBJECT (self, "Handling frame %d", frame->system_frame_number);
+  GST_LOG_OBJECT (self, "Handling frame %d", frame->system_frame_number);
 
   if (G_UNLIKELY (!g_atomic_int_get (&self->active)))
     goto flushing;
 
   task_state = gst_pad_get_task_state (GST_VIDEO_ENCODER_SRC_PAD (self));
   if (task_state == GST_TASK_STOPPED || task_state == GST_TASK_PAUSED) {
-    GstBufferPool *pool = gst_v4l2_object_get_buffer_pool (self->v4l2output);
-
     /* It is possible that the processing thread stopped due to an error or
      * when the last buffer has been met during the draining process. */
     if (self->output_flow != GST_FLOW_OK &&
@@ -780,14 +766,15 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
       GST_DEBUG_OBJECT (self, "Processing loop stopped with error: %s, leaving",
           gst_flow_get_name (self->output_flow));
       ret = self->output_flow;
-      if (pool)
-        gst_object_unref (pool);
       goto drop;
     }
+  }
 
-    /* Ensure input internal pool is active */
-    if (!gst_buffer_pool_is_active (pool)) {
-      GstStructure *config = gst_buffer_pool_get_config (pool);
+  {
+    /* Ensure input internal output pool is active */
+    GstBufferPool *opool = gst_v4l2_object_get_buffer_pool (self->v4l2output);
+    if (!gst_buffer_pool_is_active (opool)) {
+      GstStructure *config = gst_buffer_pool_get_config (opool);
       guint min = MAX (self->v4l2output->min_buffers,
           GST_V4L2_MIN_BUFFERS (self->v4l2output));
 
@@ -795,21 +782,36 @@ gst_v4l2_video_enc_handle_frame (GstVideoEncoder * encoder,
           self->v4l2output->info.size, min, min);
 
       /* There is no reason to refuse this config */
-      if (!gst_buffer_pool_set_config (pool, config)) {
-        if (pool)
-          gst_object_unref (pool);
-        goto activate_failed;
+      if (!gst_buffer_pool_set_config (opool, config)) {
+        config = gst_buffer_pool_get_config (opool);
+
+        if (gst_buffer_pool_config_validate_params (config,
+                self->input_state->caps, self->v4l2output->info.size, min,
+                min)) {
+          gst_structure_free (config);
+          if (opool)
+            gst_object_unref (opool);
+          goto activate_failed;
+        }
+
+        if (!gst_buffer_pool_set_config (opool, config)) {
+          if (opool)
+            gst_object_unref (opool);
+          goto activate_failed;
+        }
       }
 
-      if (!gst_buffer_pool_set_active (pool, TRUE)) {
-        if (pool)
-          gst_object_unref (pool);
+      if (!gst_buffer_pool_set_active (opool, TRUE)) {
+        if (opool)
+          gst_object_unref (opool);
         goto activate_failed;
       }
-      if (pool)
-        gst_object_unref (pool);
     }
+    if (opool)
+      gst_object_unref (opool);
+  }
 
+  if (task_state == GST_TASK_STOPPED || task_state == GST_TASK_PAUSED) {
     {
       GstBufferPool *cpool =
           gst_v4l2_object_get_buffer_pool (self->v4l2capture);
@@ -888,7 +890,6 @@ start_task_failed:
   {
     GST_ELEMENT_ERROR (self, RESOURCE, FAILED,
         (_("Failed to start encoding thread.")), (NULL));
-    g_atomic_int_set (&self->processing, FALSE);
     ret = GST_FLOW_ERROR;
     goto drop;
   }
@@ -1226,6 +1227,7 @@ gst_v4l2_video_enc_register (GstPlugin * plugin, GType type,
   GValue value = G_VALUE_INIT;
 
   filtered_caps = gst_caps_intersect (src_caps, codec_caps);
+  GST_MINI_OBJECT_FLAG_SET (filtered_caps, GST_MINI_OBJECT_FLAG_MAY_BE_LEAKED);
 
   if (codec != NULL && video_fd != -1) {
     if (gst_v4l2_codec_probe_levels (codec, video_fd, &value)) {
@@ -1242,7 +1244,7 @@ gst_v4l2_video_enc_register (GstPlugin * plugin, GType type,
   cdata = g_new0 (GstV4l2VideoEncCData, 1);
   cdata->device = g_strdup (device_path);
   cdata->sink_caps = gst_caps_ref (sink_caps);
-  cdata->src_caps = gst_caps_ref (filtered_caps);
+  cdata->src_caps = filtered_caps;
   cdata->codec = codec;
 
   g_type_query (type, &type_query);

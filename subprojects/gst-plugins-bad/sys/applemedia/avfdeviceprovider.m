@@ -48,6 +48,8 @@ gst_avf_device_provider_class_init (GstAVFDeviceProviderClass * klass)
   // https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad/issues/886
   dm_class->probe = gst_avf_device_provider_probe;
 
+  gst_avf_video_src_debug_init ();
+
   gst_device_provider_class_set_static_metadata (dm_class,
                                                  "AVF Device Provider", "Source/Video",
                                                  "List and provide AVF source devices",
@@ -113,6 +115,7 @@ G_GNUC_END_IGNORE_DEPRECATIONS
     result = g_list_prepend (result, gst_object_ref_sink (gst_device));
 
     gst_structure_free (props);
+    gst_caps_unref (caps);
   }
 
   result = g_list_reverse (result);

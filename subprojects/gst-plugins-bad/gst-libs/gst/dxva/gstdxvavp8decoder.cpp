@@ -25,13 +25,7 @@
 #include <string.h>
 #include <vector>
 
-/* HACK: to expose dxva data structure on UWP */
-#ifdef WINAPI_PARTITION_DESKTOP
-#undef WINAPI_PARTITION_DESKTOP
-#endif
-#define WINAPI_PARTITION_DESKTOP 1
-#include <d3d9.h>
-#include <dxva.h>
+#include "gstdxvatypedef.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_dxva_vp8_decoder_debug);
 #define GST_CAT_DEFAULT gst_dxva_vp8_decoder_debug
@@ -267,7 +261,7 @@ gst_dxva_vp8_decoder_copy_reference_frames (GstDxvaVp8Decoder * self,
         GST_CODEC_PICTURE (decoder->last_picture));
 
     if (id != 0xff) {
-      params->gld_fb_idx.Index7Bits = id;
+      params->lst_fb_idx.Index7Bits = id;
       g_ptr_array_add (priv->ref_pics, decoder->last_picture);
     }
   }

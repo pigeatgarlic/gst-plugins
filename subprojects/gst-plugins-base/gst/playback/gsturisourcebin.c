@@ -132,7 +132,11 @@ struct _OutputSlotInfo
 {
   ChildSrcPadInfo *linked_info; /* source pad info feeding this slot */
 
+  GstStream *stream;            /* The current stream */
+  GstStream *pending_stream;    /* The stream this slot should switch to */
+
   GstPad *originating_pad;      /* Pad that created this OutputSlotInfo (ref held) */
+  GstPad *pending_pad;          /* Pad this slot should use once originating_pad goes away (ref held) */
   GstPad *output_pad;           /* Output ghost pad */
 
   gboolean is_eos;              /* Did EOS get fed into the buffering element */
@@ -143,6 +147,7 @@ struct _OutputSlotInfo
   gulong bitrate_changed_id;    /* queue bitrate changed notification */
 
   guint demuxer_event_probe_id;
+  guint pending_probe_id;       /* demuxer_event_probe_id for pending_pad */
 };
 
 /**
@@ -160,7 +165,7 @@ struct _GstURISourceBin
   guint64 connection_speed;
 
   gboolean activated;           /* TRUE if the switch to PAUSED has been completed */
-  gboolean flushing;            /* TRUE if switching from PAUSED to READY */
+  gint flushing;                /* TRUE if switching from PAUSED to READY (atomic int) */
   GCond activation_cond;        /* Uses the urisourcebin lock */
 
   gboolean is_stream;
@@ -565,6 +570,35 @@ gst_uri_source_bin_finalize (GObject * obj)
 }
 
 static void
+gst_uri_source_bin_update_connection_speed (GstURISourceBin * urisrc)
+{
+  guint64 speed = 0;
+  GList *iter;
+
+  if (!urisrc->is_adaptive) {
+    return;
+  }
+
+  GST_OBJECT_LOCK (urisrc);
+  speed = urisrc->connection_speed / 1000;
+  GST_OBJECT_UNLOCK (urisrc);
+
+  GST_URI_SOURCE_BIN_LOCK (urisrc);
+  for (iter = urisrc->src_infos; iter; iter = iter->next) {
+    ChildSrcPadInfo *info = iter->data;
+    GParamSpec *pspec = NULL;
+    if (!info->demuxer)
+      continue;
+
+    pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (info->demuxer),
+        "connection-speed");
+    if (pspec != NULL)
+      g_object_set (info->demuxer, "connection-speed", speed, NULL);
+  }
+  GST_URI_SOURCE_BIN_UNLOCK (urisrc);
+}
+
+static void
 gst_uri_source_bin_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
 {
@@ -581,6 +615,7 @@ gst_uri_source_bin_set_property (GObject * object, guint prop_id,
       GST_OBJECT_LOCK (urisrc);
       urisrc->connection_speed = g_value_get_uint64 (value) * 1000;
       GST_OBJECT_UNLOCK (urisrc);
+      gst_uri_source_bin_update_connection_speed (urisrc);
       break;
     case PROP_BUFFER_SIZE:
       urisrc->buffer_size = g_value_get_int (value);
@@ -766,13 +801,28 @@ new_child_src_pad_info (GstURISourceBin * urisrc, GstPad * pad)
   return info;
 }
 
+static OutputSlotInfo *
+find_replacement_slot (ChildSrcPadInfo * info, GstStream * stream)
+{
+  GList *iter;
+
+  for (iter = info->outputs; iter; iter = iter->next) {
+    OutputSlotInfo *slot = iter->data;
+
+    if (slot->pending_stream == stream)
+      return slot;
+  }
+
+  return NULL;
+}
+
 /* Called by the signal handlers when a demuxer has produced a new stream */
 static void
 new_demuxer_pad_added_cb (GstElement * element, GstPad * pad,
     ChildSrcPadInfo * info)
 {
   GstURISourceBin *urisrc = info->urisrc;
-  OutputSlotInfo *slot;
+  OutputSlotInfo *slot = NULL;
   GstPad *output_pad;
 
   GST_DEBUG_OBJECT (element, "New pad %" GST_PTR_FORMAT, pad);
@@ -786,6 +836,32 @@ new_demuxer_pad_added_cb (GstElement * element, GstPad * pad,
         ("Adaptive demuxer is not streams-aware, check your installation"));
 
   }
+
+  /* For parsebin source pads we want to check if this is a replacement pad for
+   * which we want to re-use an existing OutputSlotInfo */
+  if (info->demuxer_is_parsebin) {
+    GstStream *stream = gst_pad_get_stream (pad);
+
+    if (stream) {
+      slot = find_replacement_slot (info, stream);
+      gst_object_unref (stream);
+      if (slot) {
+        GST_DEBUG_OBJECT (pad, "Can re-use slot %s:%s",
+            GST_DEBUG_PAD_NAME (slot->originating_pad));
+        slot->pending_pad = gst_object_ref (pad);
+        slot->pending_probe_id =
+            gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM |
+            GST_PAD_PROBE_TYPE_EVENT_FLUSH,
+            (GstPadProbeCallback) demux_pad_events, slot, NULL);
+        GST_URI_SOURCE_BIN_UNLOCK (urisrc);
+        return;
+      }
+      GST_DEBUG_OBJECT (pad, "No existing output slot to re-use");
+    } else {
+      GST_WARNING_OBJECT (pad, "No GstStream on pad ??");
+    }
+  }
+
   /* If the demuxer handles buffering and is streams-aware, we can expose it
      as-is directly. We still add an event probe to deal with EOS */
   slot = new_output_slot (info, pad);
@@ -838,8 +914,8 @@ static GstPadProbeReturn
 demux_pad_events (GstPad * pad, GstPadProbeInfo * info, OutputSlotInfo * slot)
 {
   GstURISourceBin *urisrc = slot->linked_info->urisrc;
-  GstPadProbeReturn ret = GST_PAD_PROBE_OK;
   GstEvent *ev = GST_PAD_PROBE_INFO_EVENT (info);
+  GstPadProbeReturn ret = GST_PAD_PROBE_OK;
 
   GST_URI_SOURCE_BIN_LOCK (urisrc);
 
@@ -849,6 +925,12 @@ demux_pad_events (GstPad * pad, GstPadProbeInfo * info, OutputSlotInfo * slot)
       gboolean all_streams_eos;
 
       GST_LOG_OBJECT (urisrc, "EOS on pad %" GST_PTR_FORMAT, pad);
+
+      if (slot->pending_pad && pad != slot->pending_pad) {
+        GST_DEBUG_OBJECT (pad, "A pending pad is present, dropping");
+        ret = GST_PAD_PROBE_DROP;
+        break;
+      }
 
       BUFFERING_LOCK (urisrc);
       /* Mark that we fed an EOS to this slot */
@@ -860,18 +942,20 @@ demux_pad_events (GstPad * pad, GstPadProbeInfo * info, OutputSlotInfo * slot)
         /* EOS means this element is no longer buffering */
         remove_buffering_msgs (urisrc, GST_OBJECT_CAST (slot->queue));
 
+      GST_URI_SOURCE_BIN_UNLOCK (urisrc);
       if (all_streams_eos) {
         GST_DEBUG_OBJECT (urisrc, "Posting about-to-finish");
         g_signal_emit (urisrc,
             gst_uri_source_bin_signals[SIGNAL_ABOUT_TO_FINISH], 0, NULL);
       }
+      goto unlock_done;
     }
-      break;
     case GST_EVENT_STREAM_START:
     {
       /* This is a temporary hack to notify downstream decodebin3 to *not*
        * plug in an extra parsebin */
-      if (slot->linked_info && slot->linked_info->demuxer_is_parsebin) {
+      if (urisrc->is_adaptive || (slot->linked_info
+              && slot->linked_info->demuxer_is_parsebin)) {
         GstStructure *s;
         GST_PAD_PROBE_INFO_DATA (info) = ev = gst_event_make_writable (ev);
         s = (GstStructure *) gst_event_get_structure (ev);
@@ -891,6 +975,7 @@ demux_pad_events (GstPad * pad, GstPadProbeInfo * info, OutputSlotInfo * slot)
 
   GST_URI_SOURCE_BIN_UNLOCK (urisrc);
 
+unlock_done:
   return ret;
 }
 
@@ -1123,6 +1208,19 @@ setup_multiqueue (GstURISourceBin * urisrc, ChildSrcPadInfo * info,
   gst_element_sync_state_with_parent (info->multiqueue);
 }
 
+static gboolean
+mark_stream_start_parsed (GstPad * pad, GstEvent ** event, gpointer user_data)
+{
+  if (GST_EVENT_TYPE (*event) == GST_EVENT_STREAM_START) {
+    GstStructure *s;
+    *event = gst_event_make_writable (*event);
+    s = (GstStructure *) gst_event_get_structure (*event);
+    gst_structure_set (s, "urisourcebin-parsed-data", G_TYPE_BOOLEAN, TRUE,
+        NULL);
+  }
+  return TRUE;
+}
+
 /* Called with lock held */
 static OutputSlotInfo *
 new_output_slot (ChildSrcPadInfo * info, GstPad * originating_pad)
@@ -1162,6 +1260,13 @@ new_output_slot (ChildSrcPadInfo * info, GstPad * originating_pad)
     slot->queue_sinkpad =
         gst_element_request_pad_simple (info->multiqueue, "sink_%u");
     srcpad = gst_pad_get_single_internal_link (slot->queue_sinkpad);
+    if (urisrc->is_adaptive || (slot->linked_info
+            && slot->linked_info->demuxer_is_parsebin)) {
+      /* This is a temporary hack to notify downstream decodebin3 to *not*
+       * plug in an extra parsebin */
+      gst_pad_sticky_events_foreach (originating_pad, mark_stream_start_parsed,
+          NULL);
+    }
     gst_pad_sticky_events_foreach (originating_pad, copy_sticky_events, srcpad);
     slot->output_pad = create_output_pad (slot, srcpad);
     gst_object_unref (srcpad);
@@ -1236,6 +1341,8 @@ new_output_slot (ChildSrcPadInfo * info, GstPad * originating_pad)
     slot->output_pad = create_output_pad (slot, originating_pad);
   }
   slot->originating_pad = gst_object_ref (originating_pad);
+  /* Store stream if present */
+  slot->stream = gst_pad_get_stream (originating_pad);
 
   /* save output slot so we can remove it later */
   info->outputs = g_list_append (info->outputs, slot);
@@ -1243,6 +1350,8 @@ new_output_slot (ChildSrcPadInfo * info, GstPad * originating_pad)
   GST_DEBUG_OBJECT (urisrc,
       "New output_pad %" GST_PTR_FORMAT " for originating pad %" GST_PTR_FORMAT,
       slot->output_pad, originating_pad);
+  if (slot->stream)
+    GST_DEBUG_OBJECT (urisrc, "  and stream %" GST_PTR_FORMAT, slot->stream);
 
   return slot;
 
@@ -1337,15 +1446,15 @@ expose_block_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   GST_DEBUG_OBJECT (pad, "blocking");
 
   GST_URI_SOURCE_BIN_LOCK (urisrc);
-  while (!urisrc->activated && !urisrc->flushing) {
+  while (!urisrc->activated && !g_atomic_int_get (&urisrc->flushing)) {
     GST_DEBUG_OBJECT (urisrc, "activated:%d flushing:%d", urisrc->activated,
-        urisrc->flushing);
+        g_atomic_int_get (&urisrc->flushing));
     g_cond_wait (&urisrc->activation_cond, &urisrc->lock);
   }
   GST_DEBUG_OBJECT (urisrc, "activated:%d flushing:%d", urisrc->activated,
-      urisrc->flushing);
+      g_atomic_int_get (&urisrc->flushing));
 
-  if (!urisrc->flushing)
+  if (!g_atomic_int_get (&urisrc->flushing))
     expose = TRUE;
   GST_URI_SOURCE_BIN_UNLOCK (urisrc);
   if (expose)
@@ -1405,6 +1514,31 @@ demuxer_pad_removed_cb (GstElement * element, GstPad * pad,
 
   gst_pad_remove_probe (pad, slot->demuxer_event_probe_id);
   slot->demuxer_event_probe_id = 0;
+
+  if (slot->pending_pad) {
+    /* Switch over to pending pad */
+    GST_DEBUG_OBJECT (urisrc, "Switching to pending pad <%s:%s>",
+        GST_DEBUG_PAD_NAME (slot->pending_pad));
+    slot->demuxer_event_probe_id = slot->pending_probe_id;
+    slot->pending_probe_id = 0;
+
+    gst_object_unref (slot->originating_pad);
+    slot->originating_pad = slot->pending_pad;
+    slot->pending_pad = NULL;
+
+    gst_object_unref (slot->stream);
+    slot->stream = slot->pending_stream;
+    slot->pending_stream = NULL;
+
+    if (slot->queue_sinkpad) {
+      gst_pad_link (slot->originating_pad, slot->queue_sinkpad);
+    } else {
+      gst_ghost_pad_set_target ((GstGhostPad *) slot->output_pad,
+          slot->originating_pad);
+    }
+    GST_URI_SOURCE_BIN_UNLOCK (urisrc);
+    return;
+  }
 
   if (slot->queue) {
     gboolean was_eos;
@@ -1913,7 +2047,16 @@ setup_parsebin_for_slot (ChildSrcPadInfo * info, GstPad * originating_pad)
   GST_DEBUG_OBJECT (urisrc, "Setting up parsebin for %" GST_PTR_FORMAT,
       originating_pad);
 
+  if (g_atomic_int_get (&urisrc->flushing)) {
+    GST_DEBUG_OBJECT (urisrc, "Shutting down, returning early");
+    return FALSE;
+  }
   GST_STATE_LOCK (urisrc);
+  if (g_atomic_int_get (&urisrc->flushing)) {
+    GST_DEBUG_OBJECT (urisrc, "Shutting down, returning early");
+    GST_STATE_UNLOCK (urisrc);
+    return FALSE;
+  }
   GST_URI_SOURCE_BIN_LOCK (urisrc);
 
   /* Set up optional pre-parsebin download/ringbuffer elements */
@@ -2237,6 +2380,15 @@ free_output_slot (OutputSlotInfo * slot, GstURISourceBin * urisrc)
 
   if (slot->demuxer_event_probe_id)
     gst_pad_remove_probe (slot->originating_pad, slot->demuxer_event_probe_id);
+  if (slot->pending_pad) {
+    if (slot->pending_probe_id)
+      gst_pad_remove_probe (slot->pending_pad, slot->pending_probe_id);
+    gst_object_unref (slot->pending_pad);
+  }
+  if (slot->stream)
+    gst_object_unref (slot->stream);
+  if (slot->pending_stream)
+    gst_object_unref (slot->pending_stream);
 
   gst_object_unref (slot->originating_pad);
   /* deactivate and remove the srcpad */
@@ -2686,6 +2838,65 @@ find_adaptive_demuxer_cspi_for_msg (GstURISourceBin * urisrc,
   return res;
 }
 
+static GstStream *
+find_compatible_stream (GList * streams, GstStream * stream)
+{
+  GList *iter;
+  GstStreamType stream_type = gst_stream_get_stream_type (stream);
+
+  for (iter = streams; iter; iter = iter->next) {
+    GstStream *candidate = iter->data;
+
+    if (gst_stream_get_stream_type (candidate) == stream_type)
+      return candidate;
+  }
+
+  return NULL;
+}
+
+static void
+handle_parsebin_collection (ChildSrcPadInfo * info,
+    GstStreamCollection * collection)
+{
+  GList *unused_slots = NULL, *iter;
+  GList *streams = NULL;
+  guint i, nb_streams;
+
+  nb_streams = gst_stream_collection_get_size (collection);
+  for (i = 0; i < nb_streams; i++)
+    streams =
+        g_list_append (streams, gst_stream_collection_get_stream (collection,
+            i));
+
+  /* Get list of output info slots not present in the collection */
+  for (iter = info->outputs; iter; iter = iter->next) {
+    OutputSlotInfo *output = iter->data;
+
+    if (output->stream && !g_list_find (streams, output->stream)) {
+      GST_DEBUG_OBJECT (output->originating_pad,
+          "No longer used in new collection");
+      unused_slots = g_list_append (unused_slots, output);
+    }
+  }
+
+  /* For each of those slots, check if there is a compatible stream from the
+   * collection that could be assigned to it */
+  for (iter = unused_slots; iter; iter = iter->next) {
+    OutputSlotInfo *output = iter->data;
+    GstStream *replacement = find_compatible_stream (streams, output->stream);
+    if (replacement) {
+      GST_DEBUG_OBJECT (output->originating_pad, "Assigning stream %s",
+          gst_stream_get_stream_id (replacement));
+      output->pending_stream = gst_object_ref (replacement);
+      streams = g_list_remove (streams, replacement);
+    }
+  }
+
+  g_list_free (unused_slots);
+  g_list_free (streams);
+}
+
+
 static void
 handle_message (GstBin * bin, GstMessage * msg)
 {
@@ -2705,10 +2916,14 @@ handle_message (GstBin * bin, GstMessage * msg)
     case GST_MESSAGE_STREAM_COLLECTION:
     {
       ChildSrcPadInfo *info;
-      /* We only want to forward stream collection from the source element *OR*
-       * from adaptive demuxers. We do not want to forward them from the
-       * potential parsebins since there might be many and require aggregation
-       * to be useful/coherent. */
+      /* We only want to forward stream collections:
+       * * from the source element
+       * * OR from adaptive demuxers
+       * * OR from parsebin if there is only a single ChildSrcPadInfo
+       *
+       * We do not want to forward them if there are multiple parsebins since it
+       * requires them to be aggregated to be coherent to the outside world.
+       */
       GST_URI_SOURCE_BIN_LOCK (urisrc);
       info =
           find_adaptive_demuxer_cspi_for_msg (urisrc,
@@ -2716,9 +2931,19 @@ handle_message (GstBin * bin, GstMessage * msg)
       if (info) {
         info->demuxer_streams_aware = TRUE;
         if (info->demuxer_is_parsebin) {
-          GST_DEBUG_OBJECT (bin, "Dropping stream-collection from parsebin");
-          gst_message_unref (msg);
-          msg = NULL;
+          GstStreamCollection *collection = NULL;
+          gst_message_parse_stream_collection (msg, &collection);
+          /* Check if some output slots can/could be re-used with this new collection */
+          if (collection) {
+            handle_parsebin_collection (info, collection);
+            gst_object_unref (collection);
+          }
+          if (g_list_length (urisrc->src_infos) > 1) {
+            GST_DEBUG_OBJECT (bin,
+                "Dropping stream-collection, multiple parsebins present");
+            gst_message_unref (msg);
+            msg = NULL;
+          }
         }
       } else if (GST_MESSAGE_SRC (msg) != (GstObject *) urisrc->source) {
         GST_LOG_OBJECT (bin, "Collection %" GST_PTR_FORMAT, msg);
@@ -2978,6 +3203,26 @@ gst_uri_source_bin_query (GstElement * element, GstQuery * query)
       fold_init = uri_source_query_init;
       fold_done = uri_source_query_seeking_done;
       break;
+    case GST_QUERY_SELECTABLE:
+      /* This is a special case, we need to respond to it potentially before any
+       * pads are present, so we directly target childsrcpadinfos or the source */
+      if (urisrc->is_adaptive) {
+        /* Forward directly to adaptive demuxer */
+        if (urisrc->src_infos) {
+          ChildSrcPadInfo *child = urisrc->src_infos->data;
+          if (child->demuxer) {
+            return gst_element_query (child->demuxer, query);
+          }
+        }
+        GST_ERROR_OBJECT (urisrc,
+            "Source is adaptive ... but no adaptive demuxer present ?");
+        return FALSE;
+      }
+      /* FIXME: Theoretically we should fold/try on all chilsrcpadinfo, but they
+       * might not have exposed any pads yet and as of this implementation there
+       * are no known SELECTABLE support in other elements, so we fallback on the
+       * source element */
+      return gst_element_query (urisrc->source, query);
     default:
       fold_func = (GstIteratorFoldFunction) uri_source_query_generic_fold;
       break;
@@ -3033,8 +3278,8 @@ gst_uri_source_bin_change_state (GstElement * element,
 
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
+      g_atomic_int_set (&urisrc->flushing, 0);
       GST_URI_SOURCE_BIN_LOCK (element);
-      urisrc->flushing = FALSE;
       urisrc->activated = FALSE;
       GST_URI_SOURCE_BIN_UNLOCK (element);
       GST_DEBUG ("ready to paused");
@@ -3042,8 +3287,8 @@ gst_uri_source_bin_change_state (GstElement * element,
         goto source_failed;
       break;
     case GST_STATE_CHANGE_PAUSED_TO_READY:
+      g_atomic_int_set (&urisrc->flushing, 1);
       GST_URI_SOURCE_BIN_LOCK (element);
-      urisrc->flushing = TRUE;
       g_cond_broadcast (&urisrc->activation_cond);
       GST_URI_SOURCE_BIN_UNLOCK (element);
     default:

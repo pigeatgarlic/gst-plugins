@@ -29,7 +29,7 @@
 #include <gst/gl/gl.h>
 #include <gst/gl/gstglfuncs.h>
 #include "gstqsg6material.h"
-#include <private/qrhi_p.h>
+#include <QtGui/private/qrhi_p.h>
 
 #define GST_CAT_DEFAULT gst_qsg_texture_debug
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
@@ -208,7 +208,9 @@ GstQSGTexture::GstQSGTexture(QRhiTexture * texture)
 {
   switch (texture->format()) {
     case QRhiTexture::RGBA8:
+#if (QT_VERSION >= QT_VERSION_CHECK(6, 4, 0))
     case QRhiTexture::RGB10A2:
+#endif
     case QRhiTexture::RGBA16F:
     case QRhiTexture::RGBA32F:
       this->m_has_alpha = true;
@@ -220,6 +222,10 @@ GstQSGTexture::GstQSGTexture(QRhiTexture * texture)
 
 GstQSGTexture::~GstQSGTexture()
 {
+  if (m_texture) {
+    m_texture->deleteLater();
+    m_texture = nullptr;
+  }
 }
 
 qint64
@@ -250,10 +256,10 @@ GstQSGTexture::rhiTexture() const
   return m_texture;
 }
 
-class GstQSGMaterialShader : public QSGMaterialShader {
+class GstQSG6MaterialShader : public QSGMaterialShader {
 public:
-  GstQSGMaterialShader(GstVideoFormat v_format);
-  ~GstQSGMaterialShader();
+  GstQSG6MaterialShader(GstVideoFormat v_format, GstGLTextureTarget target);
+  ~GstQSG6MaterialShader();
 
   bool updateUniformData(RenderState &state, QSGMaterial *newMaterial, QSGMaterial *oldMaterial) override;
   void updateSampledImage(RenderState &state, int binding, QSGTexture **texture, QSGMaterial *newMaterial, QSGMaterial *) override;
@@ -263,23 +269,35 @@ private:
   QSGTexture *m_textures[GST_VIDEO_MAX_PLANES];
 };
 
-GstQSGMaterialShader::GstQSGMaterialShader(GstVideoFormat v_format)
+GstQSG6MaterialShader::GstQSG6MaterialShader(GstVideoFormat v_format,
+    GstGLTextureTarget target)
   : v_format(v_format)
 {
+  const gchar *frag_shader;
+
   setShaderFileName(VertexStage, ":/org/freedesktop/gstreamer/qml6/vertex.vert.qsb");
 
   switch (v_format) {
     case GST_VIDEO_FORMAT_RGBA:
     case GST_VIDEO_FORMAT_BGRA:
     case GST_VIDEO_FORMAT_RGB:
-      setShaderFileName(FragmentStage, ":/org/freedesktop/gstreamer/qml6/RGBA.frag.qsb");
+      if (target == GST_GL_TEXTURE_TARGET_EXTERNAL_OES)
+        frag_shader = ":/org/freedesktop/gstreamer/qml6/RGBA.frag.qsb.external";
+      else
+        frag_shader = ":/org/freedesktop/gstreamer/qml6/RGBA.frag.qsb";
       break;
     case GST_VIDEO_FORMAT_YV12:
-      setShaderFileName(FragmentStage, ":/org/freedesktop/gstreamer/qml6/YUV_TRIPLANAR.frag.qsb");
+      frag_shader = ":/org/freedesktop/gstreamer/qml6/YUV_TRIPLANAR.frag.qsb";
+      break;
+    case GST_VIDEO_FORMAT_NV12:
+      frag_shader = ":/org/freedesktop/gstreamer/qml6/YUV_BIPLANAR.frag.qsb";
       break;
     default:
       g_assert_not_reached ();
   }
+
+  GST_DEBUG("load fragment shader: %s", frag_shader);
+  setShaderFileName(FragmentStage, frag_shader);
 
   m_textures[0] = nullptr;
   m_textures[1] = nullptr;
@@ -287,12 +305,18 @@ GstQSGMaterialShader::GstQSGMaterialShader(GstVideoFormat v_format)
   m_textures[3] = nullptr;
 }
 
-GstQSGMaterialShader::~GstQSGMaterialShader()
+GstQSG6MaterialShader::~GstQSG6MaterialShader()
 {
+  for (int i = 0; i < 4; i++) {
+    if (m_textures[i]) {
+      delete m_textures[i];
+      m_textures[i] = nullptr;
+    }
+  }
 }
 
 bool
-GstQSGMaterialShader::updateUniformData(RenderState &state, QSGMaterial *newMaterial, QSGMaterial *oldMaterial)
+GstQSG6MaterialShader::updateUniformData(RenderState &state, QSGMaterial *newMaterial, QSGMaterial *oldMaterial)
 {
   const GstVideoFormatInfo *finfo = gst_video_format_get_info (v_format);
   bool changed = false;
@@ -313,7 +337,7 @@ GstQSGMaterialShader::updateUniformData(RenderState &state, QSGMaterial *newMate
     changed = true;
   }
 
-  auto *mat = static_cast<GstQSGMaterial *>(newMaterial);
+  auto *mat = static_cast<GstQSG6Material *>(newMaterial);
   if (oldMaterial != newMaterial || mat->uniforms.dirty) {
     memcpy(buf->data() + 64, &mat->uniforms.input_swizzle, 4 * sizeof (int));
     memcpy(buf->data() + 80, mat->uniforms.color_matrix.constData(), 64);
@@ -334,7 +358,7 @@ GstQSGMaterialShader::updateUniformData(RenderState &state, QSGMaterial *newMate
 }
 
 void
-GstQSGMaterialShader::updateSampledImage(RenderState &state, int binding, QSGTexture **texture,
+GstQSG6MaterialShader::updateSampledImage(RenderState &state, int binding, QSGTexture **texture,
     QSGMaterial *newMaterial, QSGMaterial *)
 {
   *texture = this->m_textures[binding - 1];
@@ -342,36 +366,39 @@ GstQSGMaterialShader::updateSampledImage(RenderState &state, int binding, QSGTex
 }
 
 #define DEFINE_MATERIAL(format) \
-class G_PASTE(GstQSGMaterial_,format) : public GstQSGMaterial { \
+class G_PASTE(GstQSG6Material_,format) : public GstQSG6Material { \
 public: \
-  G_PASTE(GstQSGMaterial_,format)(); \
-  ~G_PASTE(GstQSGMaterial_,format)(); \
+  G_PASTE(GstQSG6Material_,format)(); \
+  ~G_PASTE(GstQSG6Material_,format)(); \
   QSGMaterialType *type() const override { static QSGMaterialType type; return &type; }; \
 }; \
-G_PASTE(GstQSGMaterial_,format)::G_PASTE(GstQSGMaterial_,format)() {} \
-G_PASTE(GstQSGMaterial_,format)::~G_PASTE(GstQSGMaterial_,format)() {}
+G_PASTE(GstQSG6Material_,format)::G_PASTE(GstQSG6Material_,format)() {} \
+G_PASTE(GstQSG6Material_,format)::~G_PASTE(GstQSG6Material_,format)() {}
 
 DEFINE_MATERIAL(RGBA_SWIZZLE);
 DEFINE_MATERIAL(YUV_TRIPLANAR);
+DEFINE_MATERIAL(YUV_BIPLANAR);
 
-GstQSGMaterial *
-GstQSGMaterial::new_for_format(GstVideoFormat format)
+GstQSG6Material *
+GstQSG6Material::new_for_format(GstVideoFormat format)
 {
   const GstVideoFormatInfo *finfo = gst_video_format_get_info (format);
 
   if (GST_VIDEO_FORMAT_INFO_IS_RGB (finfo) && finfo->n_planes == 1) {
-    return static_cast<GstQSGMaterial *>(new GstQSGMaterial_RGBA_SWIZZLE());
+    return static_cast<GstQSG6Material *>(new GstQSG6Material_RGBA_SWIZZLE());
   }
 
   switch (format) {
     case GST_VIDEO_FORMAT_YV12:
-      return static_cast<GstQSGMaterial *>(new GstQSGMaterial_YUV_TRIPLANAR());
+      return static_cast<GstQSG6Material *>(new GstQSG6Material_YUV_TRIPLANAR());
+    case GST_VIDEO_FORMAT_NV12:
+      return static_cast<GstQSG6Material *>(new GstQSG6Material_YUV_BIPLANAR());
     default:
       g_assert_not_reached ();
   }
 }
 
-GstQSGMaterial::GstQSGMaterial ()
+GstQSG6Material::GstQSG6Material ()
 {
   static gsize _debug;
 
@@ -392,7 +419,7 @@ GstQSGMaterial::GstQSGMaterial ()
   this->uniforms.dirty = true;
 }
 
-GstQSGMaterial::~GstQSGMaterial ()
+GstQSG6Material::~GstQSG6Material ()
 {
   g_weak_ref_clear (&this->qt_context_ref_);
   gst_buffer_replace (&this->buffer_, NULL);
@@ -406,7 +433,7 @@ GstQSGMaterial::~GstQSGMaterial ()
 }
 
 bool
-GstQSGMaterial::compatibleWith(GstVideoInfo * v_info)
+GstQSG6Material::compatibleWith(GstVideoInfo * v_info)
 {
   if (GST_VIDEO_INFO_FORMAT (&this->v_info) != GST_VIDEO_INFO_FORMAT (v_info))
     return false;
@@ -415,25 +442,36 @@ GstQSGMaterial::compatibleWith(GstVideoInfo * v_info)
 }
 
 QSGMaterialShader *
-GstQSGMaterial::createShader(QSGRendererInterface::RenderMode renderMode) const
+GstQSG6Material::createShader(QSGRendererInterface::RenderMode renderMode) const
 {
   GstVideoFormat v_format = GST_VIDEO_INFO_FORMAT (&this->v_info);
+  GstGLTextureTarget target = this->tex_target;
 
-  return new GstQSGMaterialShader(v_format);
+  return new GstQSG6MaterialShader(v_format, target);
 }
 
 /* only called from the streaming thread with scene graph thread blocked */
 void
-GstQSGMaterial::setCaps (GstCaps * caps)
+GstQSG6Material::setCaps (GstCaps * caps)
 {
+  GstStructure *s;
+  const gchar *target_str;
+
   GST_LOG ("%p setCaps %" GST_PTR_FORMAT, this, caps);
 
   gst_video_info_from_caps (&this->v_info, caps);
+
+  s = gst_caps_get_structure (caps, 0);
+  target_str = gst_structure_get_string (s, "texture-target");
+  if (!target_str)
+      target_str = GST_GL_TEXTURE_TARGET_2D_STR;
+
+  this->tex_target = gst_gl_texture_target_from_string(target_str);
 }
 
 /* only called from the streaming thread with scene graph thread blocked */
 gboolean
-GstQSGMaterial::setBuffer (GstBuffer * buffer)
+GstQSG6Material::setBuffer (GstBuffer * buffer)
 {
   GST_LOG ("%p setBuffer %" GST_PTR_FORMAT, this, buffer);
   /* FIXME: update more state here */
@@ -474,7 +512,7 @@ GstQSGMaterial::setBuffer (GstBuffer * buffer)
 
 /* only called from the streaming thread with scene graph thread blocked */
 GstBuffer *
-GstQSGMaterial::getBuffer (bool * was_bound)
+GstQSG6Material::getBuffer (bool * was_bound)
 {
   GstBuffer *buffer = NULL;
 
@@ -487,7 +525,7 @@ GstQSGMaterial::getBuffer (bool * was_bound)
 }
 
 void
-GstQSGMaterial::setFiltering(QSGTexture::Filtering filtering)
+GstQSG6Material::setFiltering(QSGTexture::Filtering filtering)
 {
   m_filtering = filtering;
 }
@@ -498,16 +536,36 @@ video_format_to_rhi_format (GstVideoFormat format, guint plane)
   switch (format) {
     case GST_VIDEO_FORMAT_RGBA:
     case GST_VIDEO_FORMAT_BGRA:
+    case GST_VIDEO_FORMAT_RGB:
       return QRhiTexture::RGBA8;
     case GST_VIDEO_FORMAT_YV12:
-      return QRhiTexture::RED_OR_ALPHA8;
+      return QRhiTexture::R8;
+    case GST_VIDEO_FORMAT_NV12:
+      return (plane == 0 ? QRhiTexture::R8 : QRhiTexture::RG8);
+    default:
+      g_assert_not_reached ();
+  }
+}
+
+static int
+video_format_to_texel_size (GstVideoFormat format, guint plane)
+{
+  switch (format) {
+    case GST_VIDEO_FORMAT_RGBA:
+    case GST_VIDEO_FORMAT_BGRA:
+    case GST_VIDEO_FORMAT_RGB:
+      return 4;
+    case GST_VIDEO_FORMAT_YV12:
+      return 1;
+    case GST_VIDEO_FORMAT_NV12:
+      return (plane == 0 ? 1 : 2);
     default:
       g_assert_not_reached ();
   }
 }
 
 QSGTexture *
-GstQSGMaterial::bind(GstQSGMaterialShader *shader, QRhi * rhi, QRhiResourceUpdateBatch *res_updates, guint plane, GstVideoFormat v_format)
+GstQSG6Material::bind(GstQSG6MaterialShader *shader, QRhi * rhi, QRhiResourceUpdateBatch *res_updates, guint plane, GstVideoFormat v_format)
 {
   GstGLContext *qt_context, *context;
   GstMemory *mem;
@@ -518,6 +576,7 @@ GstQSGMaterial::bind(GstQSGMaterialShader *shader, QRhi * rhi, QRhiResourceUpdat
   GstQSGTexture *ret;
   QRhiTexture *rhi_tex;
   QSize tex_size;
+  QRhiTexture::Flags flags = {};
 
   qt_context = GST_GL_CONTEXT (g_weak_ref_get (&this->qt_context_ref_));
   if (!qt_context)
@@ -542,7 +601,10 @@ GstQSGMaterial::bind(GstQSGMaterialShader *shader, QRhi * rhi, QRhiResourceUpdat
 
   tex_size = QSize(gst_gl_memory_get_texture_width(gl_mem), gst_gl_memory_get_texture_height (gl_mem));
 
-  rhi_tex = rhi->newTexture (video_format_to_rhi_format (v_format, plane), tex_size, 1, {});
+  if (gl_mem->tex_target == GST_GL_TEXTURE_TARGET_EXTERNAL_OES)
+    flags |= QRhiTexture::ExternalOES;
+
+  rhi_tex = rhi->newTexture (video_format_to_rhi_format (v_format, plane), tex_size, 1, flags);
   rhi_tex->createFrom({(guint64) tex_id, 0});
 
   sync_meta = gst_buffer_get_gl_sync_meta (this->sync_buffer_);
@@ -553,7 +615,8 @@ GstQSGMaterial::bind(GstQSGMaterialShader *shader, QRhi * rhi, QRhiResourceUpdat
 
   gst_gl_sync_meta_wait (sync_meta, qt_context);
 
-  GST_LOG ("%p binding GL texture %u for plane %d", this, tex_id, plane);
+  GST_LOG ("%p binding GL texture %u (%s) for plane %d",
+      this, tex_id, gst_gl_texture_target_to_string(gl_mem->tex_target), plane);
 
 out:
   if (G_UNLIKELY (use_dummy_tex)) {
@@ -564,24 +627,41 @@ out:
     /* Make this a black 64x64 pixel RGBA texture.
      * This size and format is supported pretty much everywhere, so these
      * are a safe pick. (64 pixel sidelength must be supported according
-     * to the GLES2 spec, table 6.18.)
-     * Set min/mag filters to GL_LINEAR to make sure no mipmapping is used. */
+     * to the GLES2 spec, table 6.18.) */
     const int tex_sidelength = 64;
-    std::vector < char > dummy_data (tex_sidelength * tex_sidelength * 4, 0);
 
     rhi_tex = rhi->newTexture (video_format_to_rhi_format (v_format, plane), QSize(tex_sidelength, tex_sidelength), 1, {});
+    g_assert (rhi_tex->create());
+
+    int ts = video_format_to_texel_size (v_format, plane);
+    QByteArray dummy_data (tex_sidelength * tex_sidelength * ts, 0);
+    char *data = dummy_data.data();
 
     switch (v_format) {
       case GST_VIDEO_FORMAT_RGBA:
       case GST_VIDEO_FORMAT_BGRA:
       case GST_VIDEO_FORMAT_RGB:
+        for (gsize j = 0; j < tex_sidelength; j++) {
+          for (gsize k = 0; k < tex_sidelength; k++) {
+            data[(j * tex_sidelength + k) * ts + 3] = 0xFF; // opaque
+          }
+        }
         break;
       case GST_VIDEO_FORMAT_YV12:
         if (plane == 1 || plane == 2) {
-          char *data = dummy_data.data();
           for (gsize j = 0; j < tex_sidelength; j++) {
             for (gsize k = 0; k < tex_sidelength; k++) {
-              data[(j * tex_sidelength + k) * 4 + 0] = 0x7F;
+              data[(j * tex_sidelength + k) * ts + 0] = 0x7F;
+            }
+          }
+        }
+        break;
+      case GST_VIDEO_FORMAT_NV12:
+        if (plane == 1) {
+          for (gsize j = 0; j < tex_sidelength; j++) {
+            for (gsize k = 0; k < tex_sidelength; k++) {
+                data[(j * tex_sidelength + k) * ts + 0] = 0x7F;
+                data[(j * tex_sidelength + k) * ts + 1] = 0x7F;
             }
           }
         }
@@ -591,12 +671,9 @@ out:
         break;
     }
 
-    QRhiTextureSubresourceUploadDescription sub_desc;
-
-    sub_desc.setData(QByteArray::fromRawData(dummy_data.data(), dummy_data.size()));
-
+    QRhiTextureSubresourceUploadDescription sub_desc(dummy_data);
     QRhiTextureUploadEntry entry(0, 0, sub_desc);
-    QRhiTextureUploadDescription desc({ entry });
+    QRhiTextureUploadDescription desc(entry);
     res_updates->uploadTexture(rhi_tex, desc);
 
     GST_LOG ("%p binding for plane %d fallback dummy Qt texture", this, plane);

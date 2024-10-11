@@ -73,6 +73,7 @@ struct _Qt6GLVideoItemPrivate
   GstCaps *caps;
   GstVideoInfo new_v_info;
   GstVideoInfo v_info;
+  GstVideoRectangle v_rect;
 
   gboolean initted;
   GstGLDisplay *display;
@@ -273,7 +274,7 @@ Qt6GLVideoItem::updatePaintNode(QSGNode * oldNode,
     UpdatePaintNodeData * updatePaintNodeData)
 {
   GstBuffer *old_buffer;
-  GstQSGMaterial *tex = nullptr;
+  GstQSG6Material *tex = nullptr;
   QSGGeometry *geometry = nullptr;
   bool was_bound = false;
 
@@ -297,7 +298,7 @@ Qt6GLVideoItem::updatePaintNode(QSGNode * oldNode,
     gst_gl_context_activate (this->priv->other_context, TRUE);
 
   if (texNode) {
-    tex = static_cast<GstQSGMaterial *>(texNode->material());
+    tex = static_cast<GstQSG6Material *>(texNode->material());
     if (tex && !tex->compatibleWith(&this->priv->v_info)) {
       delete texNode;
       texNode = nullptr;
@@ -309,10 +310,12 @@ Qt6GLVideoItem::updatePaintNode(QSGNode * oldNode,
     texNode = new QSGGeometryNode();
     geometry = new QSGGeometry(QSGGeometry::defaultAttributes_TexturedPoint2D(), 4);
     texNode->setGeometry(geometry);
-    tex = GstQSGMaterial::new_for_format(GST_VIDEO_INFO_FORMAT (&this->priv->v_info));
+    texNode->setFlag(QSGGeometryNode::OwnsGeometry);
+    tex = GstQSG6Material::new_for_format(GST_VIDEO_INFO_FORMAT (&this->priv->v_info));
     tex->setFiltering(is_smooth ? QSGTexture::Filtering::Linear :
         QSGTexture::Filtering::Nearest);
     texNode->setMaterial(tex);
+    texNode->setFlag(QSGGeometryNode::OwnsMaterial);
   }
 
   if ((old_buffer = tex->getBuffer(&was_bound))) {
@@ -323,6 +326,8 @@ Qt6GLVideoItem::updatePaintNode(QSGNode * oldNode,
       GST_TRACE ("old buffer %p was not bound yet, unreffing", old_buffer);
       gst_buffer_unref (old_buffer);
     } else {
+      texNode->markDirty(QSGNode::DirtyMaterial);
+
       GstBuffer *tmp_buffer;
 
       GST_TRACE ("old buffer %p was bound, queueing up for later", old_buffer);
@@ -370,6 +375,11 @@ Qt6GLVideoItem::updatePaintNode(QSGNode * oldNode,
   QRectF rect(result.x, result.y, result.w, result.h);
   QRectF sourceRect(0, 0, 1, 1);
   QSGGeometry::updateTexturedRectGeometry(geometry, rect, sourceRect);
+  if(priv->v_rect.x != result.x || priv->v_rect.y != result.y ||
+     priv->v_rect.w != result.w || priv->v_rect.h != result.h) {
+    texNode->markDirty(QSGNode::DirtyGeometry);
+    priv->v_rect = result;
+  }
 
   g_mutex_unlock (&this->priv->lock);
 
@@ -739,7 +749,7 @@ Qt6GLVideoItem::onSceneGraphInvalidated ()
   GST_FIXME ("%p scene graph invalidated", this);
 }
 
-/**
+/*
  * Retrieve and populate the GL context information from the current
  * OpenGL context.
  */

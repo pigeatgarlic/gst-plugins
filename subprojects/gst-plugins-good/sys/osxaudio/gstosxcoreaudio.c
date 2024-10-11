@@ -33,13 +33,27 @@ G_DEFINE_TYPE (GstCoreAudio, gst_core_audio, G_TYPE_OBJECT);
 #include "gstosxcoreaudioremoteio.c"
 #else
 #include "gstosxcoreaudiohal.c"
+#include <CoreAudio/CoreAudio.h>
 #endif
+
+enum
+{
+  PROP_0,
+  PROP_DEVICE,
+  PROP_IS_SRC,
+};
+
+static void gst_core_audio_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec);
+static void gst_core_audio_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec);
 
 static void
 gst_core_audio_finalize (GObject * object)
 {
   GstCoreAudio *core_audio = GST_CORE_AUDIO (object);
   g_mutex_clear (&core_audio->timing_lock);
+  g_free (core_audio->unique_id);
 
   G_OBJECT_CLASS (gst_core_audio_parent_class)->finalize (object);
 }
@@ -49,6 +63,19 @@ gst_core_audio_class_init (GstCoreAudioClass * klass)
 {
   GObjectClass *object_klass = G_OBJECT_CLASS (klass);
   object_klass->finalize = gst_core_audio_finalize;
+
+  object_klass->set_property = gst_core_audio_set_property;
+  object_klass->get_property = gst_core_audio_get_property;
+
+  g_object_class_install_property (object_klass, PROP_DEVICE,
+      g_param_spec_int ("device", "Device ID", "Device ID of input device",
+          0, G_MAXINT, 0,
+          G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY));
+
+  g_object_class_install_property (object_klass, PROP_IS_SRC,
+      g_param_spec_boolean ("is-src", "Is source", "Is a source device",
+          FALSE,
+          G_PARAM_STATIC_STRINGS | G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY));
 }
 
 static void
@@ -56,6 +83,7 @@ gst_core_audio_init (GstCoreAudio * core_audio)
 {
   core_audio->is_passthrough = FALSE;
   core_audio->device_id = kAudioDeviceUnknown;
+  core_audio->unique_id = NULL;
   core_audio->is_src = FALSE;
   core_audio->audiounit = NULL;
   core_audio->cached_caps = NULL;
@@ -65,7 +93,46 @@ gst_core_audio_init (GstCoreAudio * core_audio)
   core_audio->disabled_mixing = FALSE;
 #endif
 
+  mach_timebase_info (&core_audio->timebase);
   g_mutex_init (&core_audio->timing_lock);
+}
+
+static void
+gst_core_audio_set_property (GObject * object, guint prop_id,
+    const GValue * value, GParamSpec * pspec)
+{
+  GstCoreAudio *self = GST_CORE_AUDIO (object);
+
+  switch (prop_id) {
+    case PROP_IS_SRC:
+      self->is_src = g_value_get_boolean (value);
+      break;
+    case PROP_DEVICE:
+      self->device_id = g_value_get_int (value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
+}
+
+static void
+gst_core_audio_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstCoreAudio *self = GST_CORE_AUDIO (object);
+
+  switch (prop_id) {
+    case PROP_IS_SRC:
+      g_value_set_boolean (value, self->is_src);
+      break;
+    case PROP_DEVICE:
+      g_value_set_int (value, self->device_id);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
 }
 
 static gboolean
@@ -108,20 +175,24 @@ _audio_unit_property_listener (void *inRefCon, AudioUnit inUnit,
   }
 }
 
+static GstClockTime
+_current_time_ns (GstCoreAudio * core_audio)
+{
+  guint64 mach_t = mach_absolute_time ();
+  return gst_util_uint64_scale (mach_t, core_audio->timebase.numer,
+      core_audio->timebase.denom);
+}
+
+static GstClockTime
+_host_time_to_ns (GstCoreAudio * core_audio, uint64_t host_time)
+{
+  return gst_util_uint64_scale (host_time, core_audio->timebase.numer,
+      core_audio->timebase.denom);
+}
+
 /**************************
  *       Public API       *
  *************************/
-
-GstCoreAudio *
-gst_core_audio_new (GstObject * osxbuf)
-{
-  GstCoreAudio *core_audio;
-
-  core_audio = g_object_new (GST_TYPE_CORE_AUDIO, NULL);
-  core_audio->osxbuf = osxbuf;
-  core_audio->cached_caps = NULL;
-  return core_audio;
-}
 
 gboolean
 gst_core_audio_close (GstCoreAudio * core_audio)
@@ -214,7 +285,7 @@ gboolean
 gst_core_audio_get_samples_and_latency (GstCoreAudio * core_audio,
     gdouble rate, guint * samples, gdouble * latency)
 {
-  uint64_t now_ns = AudioConvertHostTimeToNanos (AudioGetCurrentHostTime ());
+  uint64_t now_ns = _current_time_ns (core_audio);
   gboolean ret = gst_core_audio_get_samples_and_latency_impl (core_audio, rate,
       samples, latency);
 
@@ -224,8 +295,7 @@ gst_core_audio_get_samples_and_latency (GstCoreAudio * core_audio,
   CORE_AUDIO_TIMING_LOCK (core_audio);
 
   uint32_t samples_remain = 0;
-  uint64_t anchor_ns =
-      AudioConvertHostTimeToNanos (core_audio->anchor_hosttime);
+  uint64_t anchor_ns = core_audio->anchor_hosttime_ns;
 
   if (core_audio->is_src) {
     int64_t captured_ns =
@@ -292,14 +362,15 @@ gst_core_audio_update_timing (GstCoreAudio * core_audio,
       kAudioTimeStampSampleHostTimeValid | kAudioTimeStampRateScalarValid;
 
   if ((inTimeStamp->mFlags & target_flags) == target_flags) {
-    core_audio->anchor_hosttime = inTimeStamp->mHostTime;
+    core_audio->anchor_hosttime_ns =
+        _host_time_to_ns (core_audio, inTimeStamp->mHostTime);
     core_audio->anchor_pend_samples = inNumberFrames;
     core_audio->rate_scalar = inTimeStamp->mRateScalar;
 
     GST_DEBUG_OBJECT (core_audio,
         "anchor hosttime_ns %" G_GUINT64_FORMAT
         " scalar_rate %f anchor_pend_samples %u",
-        AudioConvertHostTimeToNanos (core_audio->anchor_hosttime),
+        core_audio->anchor_hosttime_ns,
         core_audio->rate_scalar, core_audio->anchor_pend_samples);
   }
 }
@@ -352,7 +423,16 @@ gst_core_audio_set_volume (GstCoreAudio * core_audio, gfloat volume)
 gboolean
 gst_core_audio_select_device (GstCoreAudio * core_audio)
 {
-  return gst_core_audio_select_device_impl (core_audio);
+  gboolean ret = gst_core_audio_select_device_impl (core_audio);
+
+#ifndef HAVE_IOS
+  if (core_audio->device_id != kAudioDeviceUnknown)
+    core_audio->unique_id =
+        gst_core_audio_device_get_prop (core_audio->device_id,
+        kAudioDevicePropertyDeviceUID);
+#endif
+
+  return ret;
 }
 
 void

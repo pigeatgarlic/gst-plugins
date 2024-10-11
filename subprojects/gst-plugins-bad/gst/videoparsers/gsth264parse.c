@@ -212,7 +212,11 @@ gst_h264_parse_finalize (GObject * object)
 {
   GstH264Parse *h264parse = GST_H264_PARSE (object);
 
-  gst_video_user_data_unregistered_clear (&h264parse->user_data_unregistered);
+  gst_video_clear_user_data_unregistered (&h264parse->user_data_unregistered,
+      TRUE);
+  gst_video_clear_user_data (&h264parse->user_data, TRUE);
+  gst_video_clear_user_data_unregistered (&h264parse->user_data_unregistered,
+      TRUE);
 
   g_object_unref (h264parse->frame_out);
 
@@ -241,6 +245,9 @@ gst_h264_parse_reset_frame (GstH264Parse * h264parse)
   h264parse->have_pps_in_frame = FALSE;
   h264parse->have_aud_in_frame = FALSE;
   gst_adapter_clear (h264parse->frame_out);
+  gst_video_clear_user_data (&h264parse->user_data, FALSE);
+  gst_video_clear_user_data_unregistered (&h264parse->user_data_unregistered,
+      FALSE);
 }
 
 static void
@@ -584,8 +591,9 @@ gst_h264_parse_process_sei_user_data (GstH264Parse * h264parse,
   GstByteReader br;
   GstVideoParseUtilsField field = GST_VIDEO_PARSE_UTILS_FIELD_1;
 
-  /* only US country code is currently supported */
+  /* only US and UK country codes are currently supported */
   switch (rud->country_code) {
+    case ITU_T_T35_COUNTRY_CODE_UK:
     case ITU_T_T35_COUNTRY_CODE_US:
       break;
     default:
@@ -1108,8 +1116,7 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
         h264parse->field_pic_flag = slice.field_pic_flag;
       }
 
-      if (G_LIKELY (nal_type != GST_H264_NAL_SLICE_IDR &&
-              !h264parse->push_codec))
+      if (G_LIKELY (nal_type != GST_H264_NAL_SLICE_IDR))
         break;
 
       /* if we need to sneak codec NALs into the stream,
@@ -2441,6 +2448,11 @@ gst_h264_parse_update_src_caps (GstH264Parse * h264parse, GstCaps * caps)
           "Couldn't set content light level to caps");
     }
 
+    if (h264parse->user_data.lcevc_enhancement_data)
+      gst_caps_set_simple (caps, "lcevc", G_TYPE_BOOLEAN, TRUE, NULL);
+    else
+      gst_caps_set_simple (caps, "lcevc", G_TYPE_BOOLEAN, FALSE, NULL);
+
     src_caps = gst_pad_get_current_caps (GST_BASE_PARSE_SRC_PAD (h264parse));
 
     if (src_caps) {
@@ -3384,8 +3396,7 @@ gst_h264_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
       GstH264ClockTimestamp *tim =
           &h264parse->pic_timing_sei.clock_timestamp[i];
       gint field_count = -1;
-      guint64 n_frames_tmp;
-      guint n_frames = G_MAXUINT32;
+      guint64 n_frames = G_MAXUINT64;
       GstVideoTimeCodeFlags flags = 0;
       guint64 scale_n, scale_d;
 
@@ -3463,19 +3474,17 @@ gst_h264_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
       scale_n = (guint64) h264parse->parsed_fps_n * vui->num_units_in_tick;
       scale_d = (guint64) h264parse->parsed_fps_d * vui->time_scale;
 
-      n_frames_tmp = gst_util_uint64_scale (tim->n_frames, scale_n, scale_d);
-      if (n_frames_tmp <= G_MAXUINT32) {
-        if (tim->nuit_field_based_flag)
-          n_frames_tmp *= 2;
+      if (tim->nuit_field_based_flag)
+        scale_n *= 2;
 
-        if (n_frames_tmp <= G_MAXUINT32)
-          n_frames = (guint) n_frames_tmp;
-      }
+      n_frames = gst_util_uint64_scale (tim->n_frames, scale_n, scale_d);
 
-      if (n_frames != G_MAXUINT32) {
+      if (n_frames <= G_MAXUINT32) {
         GST_LOG_OBJECT (h264parse,
             "Add time code meta %02u:%02u:%02u:%02u",
-            tim->hours_value, tim->minutes_value, tim->seconds_value, n_frames);
+            tim->hours_flag ? tim->hours_value : 0,
+            tim->minutes_flag ? tim->minutes_value : 0,
+            tim->seconds_flag ? tim->seconds_value : 0, (guint) n_frames);
 
         gst_buffer_add_video_time_code_meta_full (parse_buffer,
             h264parse->parsed_fps_n,
@@ -3484,8 +3493,11 @@ gst_h264_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
             flags,
             tim->hours_flag ? tim->hours_value : 0,
             tim->minutes_flag ? tim->minutes_value : 0,
-            tim->seconds_flag ? tim->seconds_value : 0, n_frames, field_count);
-      }
+            tim->seconds_flag ? tim->seconds_value : 0,
+            (guint) n_frames, field_count);
+      } else
+        GST_WARNING_OBJECT (h264parse,
+            "Skipping time code meta, n_frames calculation failed");
     }
 
     h264parse->num_clock_timestamp = 0;
@@ -3662,10 +3674,7 @@ gst_h264_parse_set_caps (GstBaseParse * parse, GstCaps * caps)
     gst_caps_unref (in_caps);
   }
 
-  if (format == h264parse->format && align == h264parse->align) {
-    /* we did parse codec-data and might supplement src caps */
-    gst_h264_parse_update_src_caps (h264parse, caps);
-  } else if (format == GST_H264_PARSE_FORMAT_AVC
+  if (format == GST_H264_PARSE_FORMAT_AVC
       || format == GST_H264_PARSE_FORMAT_AVC3) {
     /* if input != output, and input is avc, must split before anything else */
     /* arrange to insert codec-data in-stream if needed.

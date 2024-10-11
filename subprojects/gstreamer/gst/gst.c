@@ -119,7 +119,7 @@
 #endif
 #endif
 
-#ifdef GST_FULL_COMPILATION
+#ifdef GST_FULL_STATIC_COMPILATION
 void gst_init_static_plugins ();
 #endif
 
@@ -622,7 +622,7 @@ gst_register_core_elements (GstPlugin * plugin)
 static void
 init_static_plugins (void)
 {
-#ifdef GST_FULL_COMPILATION
+#ifdef GST_FULL_STATIC_COMPILATION
   gst_init_static_plugins ();
 #else
   GModule *module;
@@ -662,7 +662,6 @@ init_post (GOptionContext * context, GOptionGroup * group, gpointer data,
   }
 
   _priv_gst_mini_object_initialize ();
-  _priv_gst_quarks_initialize ();
   _priv_gst_allocator_initialize ();
   _priv_gst_memory_initialize ();
   _priv_gst_format_initialize ();

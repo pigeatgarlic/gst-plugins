@@ -23,6 +23,7 @@
 #include <wrl.h>
 #include <memory>
 #include <atomic>
+#include <vector>
 
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi2_ring_buffer_debug);
 #define GST_CAT_DEFAULT gst_wasapi2_ring_buffer_debug
@@ -163,7 +164,7 @@ struct _GstWasapi2RingBuffer
   GstWasapi2Client *loopback_client;
   IAudioCaptureClient *capture_client;
   IAudioRenderClient *render_client;
-  ISimpleAudioVolume *volume_object;
+  IAudioStreamVolume *volume_object;
 
   GstWasapiAsyncCallback *callback_object;
   IMFAsyncResult *callback_result;
@@ -443,8 +444,6 @@ gst_wasapi2_ring_buffer_close_device_internal (GstAudioRingBuffer * buf)
   GST_WASAPI2_CLEAR_COM (self->render_client);
 
   g_mutex_lock (&self->volume_lock);
-  if (self->volume_object)
-    self->volume_object->SetMute (FALSE, nullptr);
   GST_WASAPI2_CLEAR_COM (self->volume_object);
   g_mutex_unlock (&self->volume_lock);
 
@@ -899,13 +898,15 @@ gst_wasapi2_ring_buffer_initialize_audio_client3 (GstWasapi2RingBuffer * self,
 static HRESULT
 gst_wasapi2_ring_buffer_initialize_audio_client (GstWasapi2RingBuffer * self,
     IAudioClient * client_handle, WAVEFORMATEX * mix_format, guint * period,
-    DWORD extra_flags, GstWasapi2ClientDeviceClass device_class)
+    DWORD extra_flags, GstWasapi2ClientDeviceClass device_class,
+    GstAudioRingBufferSpec * spec, gboolean low_latency)
 {
   GstAudioRingBuffer *ringbuffer = GST_AUDIO_RING_BUFFER_CAST (self);
   REFERENCE_TIME default_period, min_period;
   DWORD stream_flags =
       AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
   HRESULT hr;
+  REFERENCE_TIME buf_dur = 0;
 
   stream_flags |= extra_flags;
 
@@ -919,12 +920,29 @@ gst_wasapi2_ring_buffer_initialize_audio_client (GstWasapi2RingBuffer * self,
     GST_INFO_OBJECT (self, "wasapi2 default period: %" G_GINT64_FORMAT
         ", min period: %" G_GINT64_FORMAT, default_period, min_period);
 
+    /* https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize
+     * For a shared-mode stream that uses event-driven buffering,
+     * the caller must set both hnsPeriodicity and hnsBufferDuration to 0
+     *
+     * The above MS documentation does not seem to correct. By setting
+     * zero hnsBufferDuration, we can use audio engine determined buffer size
+     * but it seems to cause glitch depending on device. Calculate buffer size
+     * like wasapi plugin does. Note that MS example code uses non-zero
+     * buffer duration for event-driven shared-mode case as well.
+     */
+    if (spec && !low_latency) {
+      /* Ensure that the period (latency_time) used is an integral multiple of
+       * either the default period or the minimum period */
+      guint64 factor = (spec->latency_time * 10) / default_period;
+      REFERENCE_TIME period = default_period * MAX (factor, 1);
+
+      buf_dur = spec->buffer_time * 10;
+      if (buf_dur < 2 * period)
+        buf_dur = 2 * period;
+    }
+
     hr = client_handle->Initialize (AUDCLNT_SHAREMODE_SHARED, stream_flags,
-        /* hnsBufferDuration should be same as hnsPeriodicity
-         * when AUDCLNT_STREAMFLAGS_EVENTCALLBACK is used.
-         * And in case of shared mode, hnsPeriodicity should be zero, so
-         * this value should be zero as well */
-        0,
+        buf_dur,
         /* This must always be 0 in shared mode */
         0, mix_format, nullptr);
   } else {
@@ -982,7 +1000,9 @@ gst_wasapi2_ring_buffer_prepare_loopback_client (GstWasapi2RingBuffer * self)
   }
 
   hr = gst_wasapi2_ring_buffer_initialize_audio_client (self, client_handle,
-      mix_format, &period, 0, GST_WASAPI2_CLIENT_DEVICE_CLASS_RENDER);
+      mix_format, &period, 0, GST_WASAPI2_CLIENT_DEVICE_CLASS_RENDER,
+      nullptr, FALSE);
+  CoTaskMemFree (mix_format);
 
   if (!gst_wasapi2_result (hr)) {
     GST_ERROR_OBJECT (self, "Failed to initialize audio client");
@@ -1012,6 +1032,29 @@ gst_wasapi2_ring_buffer_prepare_loopback_client (GstWasapi2RingBuffer * self)
   return TRUE;
 }
 
+static HRESULT
+gst_wasapi2_ring_buffer_set_channel_volumes (IAudioStreamVolume * iface,
+    float volume)
+{
+  float target;
+  HRESULT hr = S_OK;
+
+  if (!iface)
+    return hr;
+
+  target = CLAMP (volume, 0.0f, 1.0f);
+  UINT32 channel_count = 0;
+  hr = iface->GetChannelCount (&channel_count);
+  if (!gst_wasapi2_result (hr) || channel_count == 0)
+    return hr;
+
+  std::vector < float >volumes;
+  for (guint i = 0; i < channel_count; i++)
+    volumes.push_back (target);
+
+  return iface->SetAllVolumes (channel_count, &volumes[0]);
+}
+
 static gboolean
 gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
     GstAudioRingBufferSpec * spec)
@@ -1020,9 +1063,10 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
   IAudioClient *client_handle;
   HRESULT hr;
   WAVEFORMATEX *mix_format = nullptr;
-  ComPtr < ISimpleAudioVolume > audio_volume;
+  ComPtr < IAudioStreamVolume > audio_volume;
   GstAudioChannelPosition *position = nullptr;
   guint period = 0;
+  gint segtotal = 2;
 
   GST_DEBUG_OBJECT (buf, "Acquire");
 
@@ -1083,7 +1127,8 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
       extra_flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
 
     hr = gst_wasapi2_ring_buffer_initialize_audio_client (self, client_handle,
-        mix_format, &period, extra_flags, self->device_class);
+        mix_format, &period, extra_flags, self->device_class, spec,
+        self->low_latency);
   }
 
   if (!gst_wasapi2_result (hr)) {
@@ -1102,8 +1147,6 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
     gst_audio_ring_buffer_set_channel_positions (buf, position);
   g_free (position);
 
-  CoTaskMemFree (mix_format);
-
   if (!gst_wasapi2_result (hr)) {
     GST_ERROR_OBJECT (self, "Failed to init audio client");
     goto error;
@@ -1117,18 +1160,13 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
 
   g_assert (period > 0);
 
-  if (self->buffer_size > period) {
-    GST_INFO_OBJECT (self, "Updating buffer size %d -> %d", self->buffer_size,
-        period);
-    self->buffer_size = period;
-  }
-
   spec->segsize = period * GST_AUDIO_INFO_BPF (&buf->spec.info);
-  spec->segtotal = 2;
+  segtotal = (self->buffer_size / period);
+  spec->segtotal = MAX (segtotal, 2);
 
   GST_INFO_OBJECT (self,
-      "Buffer size: %d frames, period: %d frames, segsize: %d bytes",
-      self->buffer_size, period, spec->segsize);
+      "Buffer size: %d frames, period: %d frames, segsize: %d bytes, "
+      "segtotal: %d", self->buffer_size, period, spec->segsize, spec->segtotal);
 
   if (self->device_class == GST_WASAPI2_CLIENT_DEVICE_CLASS_RENDER) {
     ComPtr < IAudioRenderClient > render_client;
@@ -1158,18 +1196,14 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
   } else {
     g_mutex_lock (&self->volume_lock);
     self->volume_object = audio_volume.Detach ();
+    float volume = (float) self->volume;
+    if (self->mute)
+      volume = 0.0f;
 
-    if (self->mute_changed) {
-      self->volume_object->SetMute (self->mute, nullptr);
-      self->mute_changed = FALSE;
-    } else {
-      self->volume_object->SetMute (FALSE, nullptr);
-    }
+    gst_wasapi2_ring_buffer_set_channel_volumes (self->volume_object, volume);
 
-    if (self->volume_changed) {
-      self->volume_object->SetMasterVolume (self->volume, nullptr);
-      self->volume_changed = FALSE;
-    }
+    self->mute_changed = FALSE;
+    self->volume_changed = FALSE;
     g_mutex_unlock (&self->volume_lock);
   }
 
@@ -1178,12 +1212,15 @@ gst_wasapi2_ring_buffer_acquire (GstAudioRingBuffer * buf,
   gst_audio_format_info_fill_silence (buf->spec.info.finfo,
       buf->memory, buf->size);
 
+  CoTaskMemFree (mix_format);
+
   return TRUE;
 
 error:
   GST_WASAPI2_CLEAR_COM (self->render_client);
   GST_WASAPI2_CLEAR_COM (self->capture_client);
   GST_WASAPI2_CLEAR_COM (self->volume_object);
+  CoTaskMemFree (mix_format);
 
   gst_wasapi2_ring_buffer_post_open_error (self);
 
@@ -1444,50 +1481,49 @@ gst_wasapi2_ring_buffer_set_mute (GstWasapi2RingBuffer * buf, gboolean mute)
 
   g_mutex_lock (&buf->volume_lock);
   buf->mute = mute;
-  if (buf->volume_object)
-    hr = buf->volume_object->SetMute (mute, nullptr);
-  else
+  if (buf->volume_object) {
+    float volume = buf->volume;
+    if (mute)
+      volume = 0.0f;
+    hr = gst_wasapi2_ring_buffer_set_channel_volumes (buf->volume_object,
+        volume);
+  } else {
     buf->mute_changed = TRUE;
+  }
+  g_mutex_unlock (&buf->volume_lock);
+
+  return hr;
+}
+
+HRESULT
+gst_wasapi2_ring_buffer_get_mute (GstWasapi2RingBuffer * buf, gboolean * mute)
+{
+  g_return_val_if_fail (GST_IS_WASAPI2_RING_BUFFER (buf), E_INVALIDARG);
+  g_return_val_if_fail (mute != nullptr, E_INVALIDARG);
+
+  g_mutex_lock (&buf->volume_lock);
+  *mute = buf->mute;
   g_mutex_unlock (&buf->volume_lock);
 
   return S_OK;
 }
 
 HRESULT
-gst_wasapi2_ring_buffer_get_mute (GstWasapi2RingBuffer * buf, gboolean * mute)
-{
-  BOOL mute_val;
-  HRESULT hr = S_OK;
-
-  g_return_val_if_fail (GST_IS_WASAPI2_RING_BUFFER (buf), E_INVALIDARG);
-  g_return_val_if_fail (mute != nullptr, E_INVALIDARG);
-
-  mute_val = buf->mute;
-
-  g_mutex_lock (&buf->volume_lock);
-  if (buf->volume_object)
-    hr = buf->volume_object->GetMute (&mute_val);
-  g_mutex_unlock (&buf->volume_lock);
-
-  *mute = mute_val ? TRUE : FALSE;
-
-  return hr;
-}
-
-HRESULT
 gst_wasapi2_ring_buffer_set_volume (GstWasapi2RingBuffer * buf, gfloat volume)
 {
-  HRESULT hr = S_OK;
+  HRESULT hr;
 
   g_return_val_if_fail (GST_IS_WASAPI2_RING_BUFFER (buf), E_INVALIDARG);
   g_return_val_if_fail (volume >= 0 && volume <= 1.0, E_INVALIDARG);
 
   g_mutex_lock (&buf->volume_lock);
   buf->volume = volume;
-  if (buf->volume_object)
-    hr = buf->volume_object->SetMasterVolume (volume, nullptr);
-  else
+  if (buf->volume_object) {
+    hr = gst_wasapi2_ring_buffer_set_channel_volumes (buf->volume_object,
+        volume);
+  } else {
     buf->volume_changed = TRUE;
+  }
   g_mutex_unlock (&buf->volume_lock);
 
   return hr;
@@ -1496,21 +1532,14 @@ gst_wasapi2_ring_buffer_set_volume (GstWasapi2RingBuffer * buf, gfloat volume)
 HRESULT
 gst_wasapi2_ring_buffer_get_volume (GstWasapi2RingBuffer * buf, gfloat * volume)
 {
-  gfloat volume_val;
-  HRESULT hr = S_OK;
-
   g_return_val_if_fail (GST_IS_WASAPI2_RING_BUFFER (buf), E_INVALIDARG);
   g_return_val_if_fail (volume != nullptr, E_INVALIDARG);
 
   g_mutex_lock (&buf->volume_lock);
-  volume_val = buf->volume;
-  if (buf->volume_object)
-    hr = buf->volume_object->GetMasterVolume (&volume_val);
+  *volume = buf->volume;
   g_mutex_unlock (&buf->volume_lock);
 
-  *volume = volume_val;
-
-  return hr;
+  return S_OK;
 }
 
 void

@@ -31,12 +31,16 @@ G_BEGIN_DECLS
 #define GST_DXVA_MPEG2_DECODER_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS((obj),GST_TYPE_DXVA_MPEG2_DECODER,GstDxvaMpeg2DecoderClass))
 #define GST_IS_DXVA_MPEG2_DECODER(obj)         (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_DXVA_MPEG2_DECODER))
 #define GST_IS_DXVA_MPEG2_DECODER_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_DXVA_MPEG2_DECODER))
-#define GST_DXVA_MPEG2_DECODER_CAST(obj)       ((GstDxvaMpeg2Decoder*)obj)
 
 typedef struct _GstDxvaMpeg2Decoder GstDxvaMpeg2Decoder;
 typedef struct _GstDxvaMpeg2DecoderClass GstDxvaMpeg2DecoderClass;
 typedef struct _GstDxvaMpeg2DecoderPrivate GstDxvaMpeg2DecoderPrivate;
 
+/**
+ * GstDxvaMpeg2Decoder:
+ *
+ * Since: 1.24
+ */
 struct _GstDxvaMpeg2Decoder
 {
   GstMpeg2Decoder parent;
@@ -45,6 +49,11 @@ struct _GstDxvaMpeg2Decoder
   GstDxvaMpeg2DecoderPrivate *priv;
 };
 
+/**
+ * GstDxvaMpeg2DecoderClass:
+ *
+ * Since: 1.24
+ */
 struct _GstDxvaMpeg2DecoderClass
 {
   GstMpeg2DecoderClass parent_class;
@@ -87,6 +96,9 @@ struct _GstDxvaMpeg2DecoderClass
 
 GST_DXVA_API
 GType gst_dxva_mpeg2_decoder_get_type (void);
+
+GST_DXVA_API
+void  gst_dxva_mpeg2_decoder_disable_postproc (GstDxvaMpeg2Decoder * decoder);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstDxvaMpeg2Decoder, gst_object_unref)
 

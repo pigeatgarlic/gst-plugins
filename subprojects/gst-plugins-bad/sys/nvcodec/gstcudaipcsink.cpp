@@ -79,6 +79,16 @@ enum
 /* *INDENT-OFF* */
 struct GstCudaIpcSinkPrivate
 {
+  GstCudaIpcSinkPrivate ()
+  {
+    meta = g_byte_array_new ();
+  }
+
+  ~GstCudaIpcSinkPrivate ()
+  {
+    g_byte_array_unref (meta);
+  }
+
   GstCudaContext *context = nullptr;
   GstCudaStream *stream = nullptr;
 
@@ -91,6 +101,7 @@ struct GstCudaIpcSinkPrivate
   GstVideoInfo mem_info;
   CUipcMemHandle prepared_handle;
   GstCudaSharableHandle prepared_os_handle;
+  GByteArray *meta;
 
   std::mutex lock;
 
@@ -188,6 +199,8 @@ gst_cuda_ipc_sink_class_init (GstCudaIpcSinkClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (cuda_ipc_sink_debug, "cudaipcsink",
       0, "cudaipcsink");
+
+  gst_type_mark_as_plugin_api (GST_TYPE_CUDA_IPC_MODE, (GstPluginAPIFlags) 0);
 }
 
 static void
@@ -424,7 +437,8 @@ gst_cuda_ipc_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   }
 
   gst_caps_set_features_simple (new_caps,
-      gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_CUDA_MEMORY, nullptr));
+      gst_caps_features_new_static_str (GST_CAPS_FEATURE_MEMORY_CUDA_MEMORY,
+          nullptr));
 
   gst_clear_caps (&priv->caps);
   priv->caps = new_caps;
@@ -446,6 +460,9 @@ gst_cuda_ipc_sink_set_caps (GstBaseSink * sink, GstCaps * caps)
   if (priv->configured_ipc_mode == GST_CUDA_IPC_MMAP) {
     gst_buffer_pool_config_set_cuda_alloc_method (config,
         GST_CUDA_MEMORY_ALLOC_MMAP);
+  } else {
+    /* legacy CUDA ipc requires default cuda allocation */
+    gst_buffer_pool_config_set_cuda_stream_ordered_alloc (config, FALSE);
   }
 
   if (!gst_buffer_pool_set_config (priv->fallback_pool, config)) {
@@ -501,6 +518,9 @@ gst_cuda_ipc_sink_propose_allocation (GstBaseSink * sink, GstQuery * query)
     if (priv->configured_ipc_mode == GST_CUDA_IPC_MMAP) {
       gst_buffer_pool_config_set_cuda_alloc_method (config,
           GST_CUDA_MEMORY_ALLOC_MMAP);
+    } else {
+      /* legacy CUDA ipc requires default cuda allocation */
+      gst_buffer_pool_config_set_cuda_stream_ordered_alloc (config, FALSE);
     }
 
     size = GST_VIDEO_INFO_SIZE (&info);
@@ -540,6 +560,20 @@ gst_cuda_ipc_sink_query (GstBaseSink * sink, GstQuery * query)
   }
 
   return GST_BASE_SINK_CLASS (parent_class)->query (sink, query);
+}
+
+static gboolean
+gst_cuda_ipc_sink_foreach_meta (GstBuffer * buffer, GstMeta ** meta,
+    GstCudaIpcSink * self)
+{
+  auto priv = self->priv;
+
+  if (!gst_meta_info_is_custom ((*meta)->info))
+    return TRUE;
+
+  gst_meta_serialize_simple (*meta, priv->meta);
+
+  return TRUE;
 }
 
 static GstFlowReturn
@@ -586,7 +620,10 @@ gst_cuda_ipc_sink_prepare (GstBaseSink * sink, GstBuffer * buf)
         (priv->configured_ipc_mode == GST_CUDA_IPC_MMAP &&
             alloc_method != GST_CUDA_MEMORY_ALLOC_MMAP) ||
         (priv->configured_ipc_mode == GST_CUDA_IPC_LEGACY &&
-            alloc_method != GST_CUDA_MEMORY_ALLOC_MALLOC)) {
+            alloc_method != GST_CUDA_MEMORY_ALLOC_MALLOC) ||
+        (priv->configured_ipc_mode == GST_CUDA_IPC_LEGACY &&
+            alloc_method == GST_CUDA_MEMORY_ALLOC_MALLOC &&
+            gst_cuda_memory_is_stream_ordered (mem))) {
       if (gst_buffer_pool_acquire_buffer (priv->fallback_pool, &cuda_buf,
               nullptr) != GST_FLOW_OK) {
         GST_ERROR_OBJECT (self, "Couldn't acquire fallback buffer");
@@ -641,6 +678,10 @@ gst_cuda_ipc_sink_prepare (GstBaseSink * sink, GstBuffer * buf)
 
   priv->prepared_sample = gst_sample_new (cuda_buf,
       priv->caps, nullptr, nullptr);
+
+  g_byte_array_set_size (priv->meta, 0);
+  gst_buffer_foreach_meta (buf,
+      (GstBufferForeachMetaFunc) gst_cuda_ipc_sink_foreach_meta, self);
 
   if (cuda_buf != buf)
     gst_buffer_unref (cuda_buf);
@@ -706,10 +747,11 @@ gst_cuda_ipc_sink_render (GstBaseSink * sink, GstBuffer * buf)
 
   if (priv->ipc_mode == GST_CUDA_IPC_LEGACY) {
     ret = gst_cuda_ipc_server_send_data (priv->server, priv->prepared_sample,
-        priv->mem_info, priv->prepared_handle, pts);
+        priv->mem_info, priv->prepared_handle, pts, priv->meta);
   } else {
     ret = gst_cuda_ipc_server_send_mmap_data (priv->server,
-        priv->prepared_sample, priv->mem_info, priv->prepared_os_handle, pts);
+        priv->prepared_sample, priv->mem_info, priv->prepared_os_handle, pts,
+        priv->meta);
   }
 
   return ret;

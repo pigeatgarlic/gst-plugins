@@ -37,7 +37,7 @@ mod rand;
 mod thread;
 
 use error::{Context, Error};
-use parse::{PtpClockIdentity, PtpMessagePayload, ReadBytesBEExt, WriteBytesBEExt};
+use parse::{PtpClockIdentity, PtpMessagePayload, PtpMessageType, ReadBytesBEExt, WriteBytesBEExt};
 use rand::rand;
 
 /// PTP Multicast group.
@@ -58,16 +58,18 @@ const MSG_TYPE_CLOCK_ID: u8 = 2;
 const MSG_TYPE_SEND_TIME_ACK: u8 = 3;
 
 /// Create a new `UdpSocket` for the given port and configure it for PTP.
-fn create_socket(port: u16) -> Result<UdpSocket, Error> {
-    let socket = net::create_udp_socket(&Ipv4Addr::UNSPECIFIED, port)
+fn create_socket(port: u16, iface: &net::InterfaceInfo, ttl: u32) -> Result<UdpSocket, Error> {
+    let socket = net::create_udp_socket(&Ipv4Addr::UNSPECIFIED, port, Some(iface))
         .with_context(|| format!("Failed to bind socket to port {}", port))?;
 
     socket
         .set_nonblocking(true)
         .context("Failed setting socket non-blocking")?;
-    socket.set_ttl(1).context("Failed setting TTL on socket")?;
     socket
-        .set_multicast_ttl_v4(1)
+        .set_ttl(ttl)
+        .context("Failed setting TTL on socket")?;
+    socket
+        .set_multicast_ttl_v4(ttl)
         .context("Failed to set multicast TTL on socket")?;
 
     Ok(socket)
@@ -123,9 +125,10 @@ fn run() -> Result<(), Error> {
     for iface in &ifaces {
         info!("Binding to interface {}", iface.name);
 
-        let event_socket = create_socket(PTP_EVENT_PORT).context("Failed creating event socket")?;
-        let general_socket =
-            create_socket(PTP_GENERAL_PORT).context("Failed creating general socket")?;
+        let event_socket = create_socket(PTP_EVENT_PORT, iface, args.ttl)
+            .context("Failed creating event socket")?;
+        let general_socket = create_socket(PTP_GENERAL_PORT, iface, args.ttl)
+            .context("Failed creating general socket")?;
 
         for socket in [&event_socket, &general_socket].iter() {
             net::join_multicast_v4(socket, &PTP_MULTICAST_ADDR, iface)
@@ -237,12 +240,16 @@ fn run() -> Result<(), Error> {
                     trace!("Received PTP message {:#?}", ptp_message);
                 }
 
-                if ptp_message.source_port_identity.clock_identity == u64::from_be_bytes(clock_id) {
+                // The delay request is the only message that is sent
+                // from PTP clock implementation, if others are added
+                // additional match arms should be added.
+                if [PtpMessageType::DELAY_REQ].contains(&ptp_message.message_type) {
                     if args.verbose {
                         trace!("Ignoring our own PTP message");
                     }
                     continue 'next_packet;
                 }
+
                 if let PtpMessagePayload::DelayResp {
                     requesting_port_identity: PtpClockIdentity { clock_identity, .. },
                     ..

@@ -56,6 +56,8 @@ typedef enum {
   GST_MSDK_FLAG_SCALING_MODE = 1 << 9,
   GST_MSDK_FLAG_FRC          = 1 << 10,
   GST_MSDK_FLAG_VIDEO_DIRECTION = 1 << 11,
+  GST_MSDK_FLAG_TONE_MAPPING = 1 << 12,
+  GST_MSDK_FLAG_INTERPOLATION_METHOD = 1 << 13
 } GstMsdkVppFlags;
 
 struct _GstMsdkVPP
@@ -91,6 +93,8 @@ struct _GstMsdkVPP
   /* To check if sinkcaps have HDR SEIs*/
   gboolean have_mdcv;
   gboolean have_cll;
+  guint64 sink_modifier;
+  guint64 src_modifier;
 
   /* element properties */
   gboolean hardware;
@@ -106,6 +110,9 @@ struct _GstMsdkVPP
   guint detail;
   guint mirroring;
   guint scaling_mode;
+#if (MFX_VERSION >= 1033)
+  guint interpolation_method;
+#endif
   gboolean keep_aspect;
   guint frc_algm;
   guint video_direction;

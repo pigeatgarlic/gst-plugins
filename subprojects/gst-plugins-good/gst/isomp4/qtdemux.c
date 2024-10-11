@@ -1152,6 +1152,10 @@ gst_qtdemux_adjust_seek (GstQTDemux * qtdemux, gint64 desired_time,
     if (CUR_STREAM (str)->sparse && !use_sparse)
       continue;
 
+    /* raw audio streams can be ignored as we can seek anywhere within them */
+    if (str->subtype == FOURCC_soun && str->need_clip)
+      continue;
+
     seg_idx = gst_qtdemux_find_segment (qtdemux, str, desired_time);
     GST_DEBUG_OBJECT (qtdemux, "align segment %d", seg_idx);
 
@@ -3263,7 +3267,7 @@ qtdemux_parse_trex (GstQTDemux * qtdemux, QtDemuxStream * stream,
 
   /* even then, above values are better than random ... */
   if (G_UNLIKELY (!stream->parsed_trex)) {
-    GST_WARNING_OBJECT (qtdemux,
+    GST_INFO_OBJECT (qtdemux,
         "failed to find fragment defaults for stream %d", stream->track_id);
     return FALSE;
   }
@@ -4029,7 +4033,7 @@ qtdemux_parse_sgpd (GstQTDemux * qtdemux, QtDemuxStream * stream,
       skip_byte_block = possible_pattern_info & 0x0f;
     }
 
-    kid_buf = _gst_buffer_new_wrapped ((guint8 *) kid, 16, NULL);
+    kid_buf = gst_buffer_new_memdup (kid, 16);
 
     props = gst_structure_new ("application/x-cenc",
         "iv_size", G_TYPE_UINT, iv_size,
@@ -4046,8 +4050,8 @@ qtdemux_parse_sgpd (GstQTDemux * qtdemux, QtDemuxStream * stream,
       }
 
       if (constant_iv != NULL) {
-        GstBuffer *constant_iv_buf = _gst_buffer_new_wrapped (
-            (guint8 *) constant_iv, constant_iv_size, NULL);
+        GstBuffer *constant_iv_buf = gst_buffer_new_memdup (
+            (guint8 *) constant_iv, constant_iv_size);
         gst_structure_set (props,
             "constant_iv_size", G_TYPE_UINT, constant_iv_size,
             "iv", GST_TYPE_BUFFER, constant_iv_buf, NULL);
@@ -5369,7 +5373,12 @@ gst_qtdemux_seek_to_previous_keyframe (GstQTDemux * qtdemux)
     }
 
     /* Remember until where we want to go */
-    str->to_sample = str->from_sample - 1;
+    if (str->from_sample == 0) {
+      GST_LOG_OBJECT (qtdemux, "already at sample 0");
+      str->to_sample = 0;
+    } else {
+      str->to_sample = str->from_sample - 1;
+    }
     /* Define our time position */
     target_ts =
         str->samples[k_index].timestamp + str->samples[k_index].pts_offset;
@@ -6208,7 +6217,7 @@ extract_cc_from_data (QtDemuxStream * stream, const guint8 * data, gsize size,
             else
               GST_WARNING_OBJECT (stream->pad,
                   "Got multiple [cdat] atoms in a c608 sample. This is unsupported for now. Please file a bug");
-          } else {
+          } else if (fourcc == FOURCC_cdt2) {
             if (cdt2 == NULL)
               cdt2 =
                   convert_to_s334_1a (data + atom_length + 8,
@@ -6216,6 +6225,10 @@ extract_cc_from_data (QtDemuxStream * stream, const guint8 * data, gsize size,
             else
               GST_WARNING_OBJECT (stream->pad,
                   "Got multiple [cdt2] atoms in a c608 sample. This is unsupported for now. Please file a bug");
+          } else {
+            GST_WARNING_OBJECT (stream->pad,
+                "Unknown second data atom (%" GST_FOURCC_FORMAT ") for CEA608",
+                GST_FOURCC_ARGS (fourcc));
           }
         }
       }
@@ -8444,24 +8457,23 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
           keyframe = QTSAMPLE_KEYFRAME (stream, sample);
 
           /* check for segment end */
-          if (G_UNLIKELY (demux->segment.stop != -1
-                  && demux->segment.stop <= stream_pts && keyframe)
-              && !(demux->upstream_format_is_time && demux->segment.rate < 0)) {
+          if (G_UNLIKELY (stream->segment.stop != -1
+                  && stream->segment.stop <= stream_pts && keyframe)
+              && !(demux->upstream_format_is_time && stream->segment.rate < 0)) {
             GST_DEBUG_OBJECT (demux, "we reached the end of our segment.");
             stream->time_position = GST_CLOCK_TIME_NONE;        /* this means EOS */
 
             /* skip this data, stream is EOS */
             gst_adapter_flush (demux->adapter, demux->neededbytes);
-            demux->offset += demux->neededbytes;
 
-            /* check if all streams are eos */
             ret = GST_FLOW_EOS;
-            for (i = 0; i < QTDEMUX_N_STREAMS (demux); i++) {
-              if (!STREAM_IS_EOS (QTDEMUX_NTH_STREAM (demux, i))) {
-                ret = GST_FLOW_OK;
-                break;
-              }
-            }
+          } else if ((demux->segment.flags &
+                  GST_SEGMENT_FLAG_TRICKMODE_KEY_UNITS) != 0 &&
+              stream->subtype == FOURCC_vide && !keyframe) {
+            GST_LOG_OBJECT (demux, "Skipping non-keyframe on track-id %u",
+                stream->track_id);
+            gst_adapter_flush (demux->adapter, demux->neededbytes);
+            ret = GST_FLOW_OK;
           } else {
             GstBuffer *outbuf;
 
@@ -9582,13 +9594,8 @@ gst_qtdemux_configure_stream (GstQTDemux * qtdemux, QtDemuxStream * stream)
       if (CUR_STREAM (stream)->n_channels > 0)
         gst_caps_set_simple (CUR_STREAM (stream)->caps,
             "channels", G_TYPE_INT, CUR_STREAM (stream)->n_channels, NULL);
-      if (CUR_STREAM (stream)->n_channels > 2) {
-        /* FIXME: Need to parse the 'chan' atom to get channel layouts
-         * correctly; this is just the minimum we can do - assume
-         * we don't actually have any channel positions. */
-        gst_caps_set_simple (CUR_STREAM (stream)->caps,
-            "channel-mask", GST_TYPE_BITMASK, G_GUINT64_CONSTANT (0), NULL);
-      }
+      /* FIXME: Need to parse the 'chan' atom to get channel layouts
+       * correctly. */
     }
   }
 
@@ -12180,7 +12187,7 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
             guint16 primaries = GST_READ_UINT16_BE (colr_data + 12);
             guint16 transfer_function = GST_READ_UINT16_BE (colr_data + 14);
             guint16 matrix = GST_READ_UINT16_BE (colr_data + 16);
-            gboolean full_range = len == 19 ? colr_data[17] >> 7 : FALSE;
+            gboolean full_range = len == 19 ? colr_data[18] >> 7 : FALSE;
 
             CUR_STREAM (stream)->colorimetry.primaries =
                 gst_video_color_primaries_from_iso (primaries);
@@ -12223,9 +12230,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
               else
                 size = len - 0x8;
 
-              if (size < 1)
-                /* No real data, so break out */
-                break;
+              /* No real data, so skip */
+              if (size < 1) {
+                len -= 8;
+                avc_data += 8;
+                continue;
+              }
 
               switch (QT_FOURCC (avc_data + 0x4)) {
                 case FOURCC_avcC:
@@ -12340,9 +12350,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
               else
                 size = len - 0x8;
 
-              if (size < 1)
-                /* No real data, so break out */
-                break;
+              /* No real data, so skip */
+              if (size < 1) {
+                len -= 8;
+                hevc_data += 8;
+                continue;
+              }
 
               switch (QT_FOURCC (hevc_data + 0x4)) {
                 case FOURCC_hvcC:
@@ -12764,9 +12777,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
               else
                 size = len - 8;
 
-              if (size < 1)
-                /* No real data, so break out */
-                break;
+              /* No real data, so skip */
+              if (size < 1) {
+                len -= 8;
+                vc1_data += 8;
+                continue;
+              }
 
               switch (QT_FOURCC (vc1_data + 0x4)) {
                 case GST_MAKE_FOURCC ('d', 'v', 'c', '1'):
@@ -12806,9 +12822,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
               else
                 size = len - 0x8;
 
-              if (size < 1)
-                /* No real data, so break out */
-                break;
+              /* No real data, so skip */
+              if (size < 1) {
+                len -= 8;
+                av1_data += 8;
+                continue;
+              }
 
               switch (QT_FOURCC (av1_data + 0x4)) {
                 case FOURCC_av1C:
@@ -12916,9 +12935,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
               else
                 size = len - 0x8;
 
-              if (size < 1)
-                /* No real data, so break out */
-                break;
+              /* No real data, so skip */
+              if (size < 1) {
+                len -= 8;
+                vpcc_data += 8;
+                continue;
+              }
 
               switch (QT_FOURCC (vpcc_data + 0x4)) {
                 case FOURCC_vpcC:
@@ -13418,9 +13440,12 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
             else
               size = len - 8;
 
-            if (size < 1)
-              /* No real data, so break out */
-              break;
+            /* No real data, so skip */
+            if (size < 1) {
+              len -= 8;
+              wfex_data += 8;
+              continue;
+            }
 
             switch (QT_FOURCC (wfex_data + 4)) {
               case GST_MAKE_FOURCC ('w', 'f', 'e', 'x'):
@@ -14132,6 +14157,18 @@ qtdemux_parse_trak (GstQTDemux * qtdemux, GNode * trak)
     lang_code = gst_tag_get_language_code (stream->lang_id);
     gst_tag_list_add (stream->stream_tags, GST_TAG_MERGE_REPLACE,
         GST_TAG_LANGUAGE_CODE, (lang_code) ? lang_code : stream->lang_id, NULL);
+  }
+
+  /* https://dev.w3.org/html5/html-sourcing-inband-tracks/#mpeg4
+   * FIXME: For CEA 608 and CEA 708 we should use the channel_number and
+   * service_number respectively.
+   */
+  if (stream->track_id) {
+    gchar *track_id_str =
+        g_strdup_printf ("%" G_GUINT32_FORMAT, stream->track_id);
+    gst_tag_list_add (stream->stream_tags, GST_TAG_MERGE_REPLACE,
+        GST_TAG_CONTAINER_SPECIFIC_TRACK_ID, track_id_str, NULL);
+    g_free (track_id_str);
   }
 
   /* Check for UDTA tags */
@@ -15809,6 +15846,10 @@ qtdemux_video_caps (GstQTDemux * qtdemux, QtDemuxStream * stream,
       g_free (format);
       break;
     }
+    case FOURCC_LAGS:
+      _codec ("Lagarith lossless video codec");
+      caps = gst_caps_new_empty_simple ("video/x-lagarith");
+      break;
     case GST_MAKE_FOURCC ('k', 'p', 'c', 'd'):
     default:
     {
@@ -16181,7 +16222,7 @@ qtdemux_audio_caps (GstQTDemux * qtdemux, QtDemuxStream * stream,
   if (g_str_has_prefix (name, "audio/x-raw")) {
     stream->need_clip = TRUE;
     stream->min_buffer_size = 1024 * entry->bytes_per_frame;
-    stream->max_buffer_size = 4096 * entry->bytes_per_frame;
+    stream->max_buffer_size = entry->rate * entry->bytes_per_frame;
     GST_DEBUG ("setting min/max buffer sizes to %d/%d", stream->min_buffer_size,
         stream->max_buffer_size);
   }

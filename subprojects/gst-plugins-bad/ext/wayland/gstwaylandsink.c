@@ -365,35 +365,62 @@ gst_wayland_sink_set_display_from_context (GstWaylandSink * self,
 }
 
 static gboolean
-gst_wayland_sink_find_display (GstWaylandSink * self)
+gst_wayland_sink_query_context (GstWaylandSink * self, const gchar * type)
 {
   GstQuery *query;
+  gboolean ret;
+
+  query = gst_query_new_context (type);
+  ret = gst_pad_peer_query (GST_VIDEO_SINK_PAD (self), query);
+
+  if (ret) {
+    GstContext *context = NULL;
+    gst_query_parse_context (query, &context);
+    gst_wayland_sink_set_display_from_context (self, context);
+  }
+
+  gst_query_unref (query);
+  return ret;
+}
+
+static gboolean
+gst_wayland_sink_post_need_context (GstWaylandSink * self, const gchar * type)
+{
   GstMessage *msg;
-  GstContext *context = NULL;
+
+  /* now ask the application to set the display handle */
+  msg = gst_message_new_need_context (GST_OBJECT_CAST (self), type);
+
+  g_mutex_unlock (&self->display_lock);
+  gst_element_post_message (GST_ELEMENT_CAST (self), msg);
+  /* at this point we expect gst_wayland_sink_set_context
+   * to get called and fill self->display */
+  g_mutex_lock (&self->display_lock);
+
+  return self->display != NULL;
+}
+
+static gboolean
+gst_wayland_sink_find_display (GstWaylandSink * self)
+{
   GError *error = NULL;
   gboolean ret = TRUE;
 
   g_mutex_lock (&self->display_lock);
 
   if (!self->display) {
-    /* first query upstream for the needed display handle */
-    query = gst_query_new_context (GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE);
-    if (gst_pad_peer_query (GST_VIDEO_SINK_PAD (self), query)) {
-      gst_query_parse_context (query, &context);
-      gst_wayland_sink_set_display_from_context (self, context);
+    if (!gst_wayland_sink_query_context (self,
+            GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE)) {
+      gst_wayland_sink_query_context (self,
+          GST_WL_DISPLAY_HANDLE_LEGACY_CONTEXT_TYPE);
     }
-    gst_query_unref (query);
 
     if (G_LIKELY (!self->display)) {
-      /* now ask the application to set the display handle */
-      msg = gst_message_new_need_context (GST_OBJECT_CAST (self),
-          GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE);
-
-      g_mutex_unlock (&self->display_lock);
-      gst_element_post_message (GST_ELEMENT_CAST (self), msg);
-      /* at this point we expect gst_wayland_sink_set_context
-       * to get called and fill self->display */
-      g_mutex_lock (&self->display_lock);
+      if (!gst_wayland_sink_post_need_context (self,
+              GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE)) {
+        gst_wayland_sink_post_need_context (self,
+            GST_WL_DISPLAY_HANDLE_LEGACY_CONTEXT_TYPE);
+      }
 
       if (!self->display) {
         /* if the application didn't set a display, let's create it ourselves */
@@ -448,13 +475,6 @@ gst_wayland_sink_change_state (GstElement * element, GstStateChange transition)
         }
       }
 
-      g_mutex_lock (&self->render_lock);
-      if (self->callback) {
-        wl_callback_destroy (self->callback);
-        self->callback = NULL;
-      }
-      self->redraw_pending = FALSE;
-      g_mutex_unlock (&self->render_lock);
       break;
     case GST_STATE_CHANGE_READY_TO_NULL:
       g_mutex_lock (&self->display_lock);
@@ -487,7 +507,9 @@ gst_wayland_sink_set_context (GstElement * element, GstContext * context)
   GstWaylandSink *self = GST_WAYLAND_SINK (element);
 
   if (gst_context_has_context_type (context,
-          GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE)) {
+          GST_WL_DISPLAY_HANDLE_CONTEXT_TYPE) ||
+      gst_context_has_context_type (context,
+          GST_WL_DISPLAY_HANDLE_LEGACY_CONTEXT_TYPE)) {
     g_mutex_lock (&self->display_lock);
     if (G_LIKELY (!self->display)) {
       gst_wayland_sink_set_display_from_context (self, context);
@@ -616,6 +638,7 @@ gst_wayland_update_pool (GstWaylandSink * self, GstAllocator * allocator)
     gst_object_unref (self->pool);
   }
   self->pool = gst_wl_video_buffer_pool_new ();
+  gst_object_ref_sink (self->pool);
 
   config = gst_buffer_pool_get_config (self->pool);
   gst_buffer_pool_config_set_params (config, self->caps, size, 2, 0);
@@ -637,7 +660,7 @@ gst_wayland_activate_shm_pool (GstWaylandSink * self)
     gboolean is_shm = FALSE;
 
     if (gst_buffer_pool_config_get_allocator (config, &alloc, NULL) && alloc)
-      is_shm = GST_IS_WL_SHM_ALLOCATOR (alloc);
+      is_shm = GST_IS_SHM_ALLOCATOR (alloc);
 
     gst_structure_free (config);
 
@@ -645,7 +668,7 @@ gst_wayland_activate_shm_pool (GstWaylandSink * self)
       return TRUE;
   }
 
-  alloc = gst_wl_shm_allocator_get ();
+  alloc = gst_shm_allocator_get ();
   gst_wayland_update_pool (self, alloc);
   gst_object_unref (alloc);
 
@@ -764,30 +787,45 @@ unsupported_format:
 static gboolean
 gst_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
 {
-  GstWaylandSink *self = GST_WAYLAND_SINK (bsink);
   GstCaps *caps;
   GstBufferPool *pool = NULL;
   gboolean need_pool;
   GstAllocator *alloc;
+  GstVideoInfoDmaDrm drm_info;
+  GstVideoInfo vinfo;
+  guint size;
 
   gst_query_parse_allocation (query, &caps, &need_pool);
+
+  if (caps == NULL)
+    return FALSE;
+
+  if (gst_video_is_dma_drm_caps (caps)) {
+    if (!gst_video_info_dma_drm_from_caps (&drm_info, caps))
+      return FALSE;
+    size = drm_info.vinfo.size;
+  } else {
+    /* extract info from caps */
+    if (!gst_video_info_from_caps (&vinfo, caps))
+      return FALSE;
+    size = vinfo.size;
+  }
 
   if (need_pool) {
     GstStructure *config;
     pool = gst_wl_video_buffer_pool_new ();
     config = gst_buffer_pool_get_config (pool);
-    gst_buffer_pool_config_set_params (config,
-        caps, self->video_info.size, 2, 0);
+    gst_buffer_pool_config_set_params (config, caps, size, 2, 0);
     gst_buffer_pool_config_set_allocator (config,
-        gst_wl_shm_allocator_get (), NULL);
+        gst_shm_allocator_get (), NULL);
     gst_buffer_pool_set_config (pool, config);
   }
 
-  gst_query_add_allocation_pool (query, pool, self->video_info.size, 2, 0);
+  gst_query_add_allocation_pool (query, pool, size, 2, 0);
   if (pool)
     g_object_unref (pool);
 
-  alloc = gst_wl_shm_allocator_get ();
+  alloc = gst_shm_allocator_get ();
   gst_query_add_allocation_param (query, alloc, NULL);
   gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
   g_object_unref (alloc);
@@ -795,49 +833,20 @@ gst_wayland_sink_propose_allocation (GstBaseSink * bsink, GstQuery * query)
   return TRUE;
 }
 
-static void
-frame_redraw_callback (void *data, struct wl_callback *callback, uint32_t time)
-{
-  GstWaylandSink *self = data;
-
-  GST_LOG_OBJECT (self, "frame_redraw_cb");
-
-  g_mutex_lock (&self->render_lock);
-  self->redraw_pending = FALSE;
-
-  if (self->callback) {
-    wl_callback_destroy (callback);
-    self->callback = NULL;
-  }
-  g_mutex_unlock (&self->render_lock);
-}
-
-static const struct wl_callback_listener frame_callback_listener = {
-  frame_redraw_callback
-};
-
 /* must be called with the render lock */
-static void
+static gboolean
 render_last_buffer (GstWaylandSink * self, gboolean redraw)
 {
   GstWlBuffer *wlbuffer;
   const GstVideoInfo *info = NULL;
-  struct wl_surface *surface;
-  struct wl_callback *callback;
 
   wlbuffer = gst_buffer_get_wl_buffer (self->display, self->last_buffer);
-  surface = gst_wl_window_get_wl_surface (self->window);
-
-  self->redraw_pending = TRUE;
-  callback = wl_surface_frame (surface);
-  self->callback = callback;
-  wl_callback_add_listener (callback, &frame_callback_listener, self);
 
   if (G_UNLIKELY (self->video_info_changed && !redraw)) {
     info = &self->video_info;
     self->video_info_changed = FALSE;
   }
-  gst_wl_window_render (self->window, wlbuffer, info);
+  return gst_wl_window_render (self->window, wlbuffer, info);
 }
 
 static void
@@ -881,14 +890,6 @@ gst_wayland_sink_show_frame (GstVideoSink * vsink, GstBuffer * buffer)
       gst_wl_window_set_rotate_method (self->window,
           self->current_rotate_method);
     }
-  }
-
-  /* drop buffers until we get a frame callback */
-  if (self->redraw_pending) {
-    GST_LOG_OBJECT (self, "buffer %" GST_PTR_FORMAT " dropped (redraw pending)",
-        buffer);
-    ret = GST_BASE_SINK_FLOW_DROPPED;
-    goto done;
   }
 
   /* make sure that the application has called set_render_rectangle() */
@@ -1050,7 +1051,8 @@ render:
   }
 
   gst_buffer_replace (&self->last_buffer, to_render);
-  render_last_buffer (self, FALSE);
+  if (!render_last_buffer (self, FALSE))
+    ret = GST_BASE_SINK_FLOW_DROPPED;
 
   if (buffer != to_render)
     gst_buffer_unref (to_render);
@@ -1194,7 +1196,7 @@ gst_wayland_sink_expose (GstVideoOverlay * overlay)
   GST_DEBUG_OBJECT (self, "expose");
 
   g_mutex_lock (&self->render_lock);
-  if (self->last_buffer && !self->redraw_pending) {
+  if (self->last_buffer) {
     GST_DEBUG_OBJECT (self, "redrawing last buffer");
     render_last_buffer (self, TRUE);
   }

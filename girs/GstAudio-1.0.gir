@@ -794,6 +794,11 @@ format.</doc>
         </parameter>
       </parameters>
     </function-macro>
+    <constant name="AUDIO_FORMAT_LAST" value="32" c:type="GST_AUDIO_FORMAT_LAST" version="1.26">
+      <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.h">Number of audio formats in #GstAudioFormat.</doc>
+      <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.h"/>
+      <type name="gint" c:type="gint"/>
+    </constant>
     <function-macro name="AUDIO_INFO_BPF" c:identifier="GST_AUDIO_INFO_BPF" introspectable="0">
       <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-info.h"/>
       <parameters>
@@ -6413,12 +6418,18 @@ string is not a known format.</doc>
         </parameters>
       </function>
       <function name="to_string" c:identifier="gst_audio_format_to_string">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">Returns a string containing a descriptive name for the #GstAudioFormat.
+
+Since 1.26 this can also be used with %GST_AUDIO_FORMAT_UNKNOWN, previous
+versions were printing a critical warning and returned %NULL.</doc>
         <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.h"/>
         <return-value transfer-ownership="none">
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">the name corresponding to @format</doc>
           <type name="utf8" c:type="const gchar*"/>
         </return-value>
         <parameters>
           <parameter name="format" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">a #GstAudioFormat audio format</doc>
             <type name="AudioFormat" c:type="GstAudioFormat"/>
           </parameter>
         </parameters>
@@ -7882,6 +7893,38 @@ MT safe.</doc>
           </instance-parameter>
         </parameters>
       </method>
+      <method name="get_segbase" c:identifier="gst_audio_ring_buffer_get_segbase" version="1.26">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Gets the current segment base number of the ringbuffer.
+
+MT safe.</doc>
+        <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
+        <return-value transfer-ownership="none">
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Current segment base number of the ringbuffer.</doc>
+          <type name="guint64" c:type="guint64"/>
+        </return-value>
+        <parameters>
+          <instance-parameter name="buf" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">the #GstAudioRingBuffer to use</doc>
+            <type name="AudioRingBuffer" c:type="GstAudioRingBuffer*"/>
+          </instance-parameter>
+        </parameters>
+      </method>
+      <method name="get_segdone" c:identifier="gst_audio_ring_buffer_get_segdone" version="1.26">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Gets the current segment number of the ringbuffer.
+
+MT safe.</doc>
+        <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
+        <return-value transfer-ownership="none">
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Current segment number of the ringbuffer.</doc>
+          <type name="guint64" c:type="guint64"/>
+        </return-value>
+        <parameters>
+          <instance-parameter name="buf" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">the #GstAudioRingBuffer to use</doc>
+            <type name="AudioRingBuffer" c:type="GstAudioRingBuffer*"/>
+          </instance-parameter>
+        </parameters>
+      </method>
       <method name="is_acquired" c:identifier="gst_audio_ring_buffer_is_acquired">
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Check if the ringbuffer is acquired and ready to use.</doc>
         <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
@@ -8223,6 +8266,25 @@ MT safe.</doc>
           </parameter>
         </parameters>
       </method>
+      <method name="set_segdone" c:identifier="gst_audio_ring_buffer_set_segdone" version="1.26">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">Sets the current segment number of the ringbuffer.
+
+MT safe.</doc>
+        <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
+        <return-value transfer-ownership="none">
+          <type name="none" c:type="void"/>
+        </return-value>
+        <parameters>
+          <instance-parameter name="buf" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">the #GstAudioRingBuffer to use</doc>
+            <type name="AudioRingBuffer" c:type="GstAudioRingBuffer*"/>
+          </instance-parameter>
+          <parameter name="segdone" transfer-ownership="none">
+            <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.c">the segment number to set</doc>
+            <type name="guint64" c:type="guint64"/>
+          </parameter>
+        </parameters>
+      </method>
       <method name="set_timestamp" c:identifier="gst_audio_ring_buffer_set_timestamp">
         <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
         <return-value transfer-ownership="none">
@@ -8352,8 +8414,11 @@ MT safe.</doc>
       <field name="cb_data_notify" readable="0" private="1">
         <type name="GLib.DestroyNotify" c:type="GDestroyNotify"/>
       </field>
+      <field name="priv" readable="0" private="1">
+        <type name="AudioRingBufferPrivate" c:type="GstAudioRingBufferPrivate*"/>
+      </field>
       <field name="_gst_reserved" readable="0" private="1">
-        <array zero-terminated="0" fixed-size="3">
+        <array zero-terminated="0" fixed-size="2">
           <type name="gpointer" c:type="gpointer"/>
         </array>
       </field>
@@ -8676,6 +8741,9 @@ with a flush or stop.</doc>
         <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h">samples in DSD format (Since: 1.24)</doc>
       </member>
     </enumeration>
+    <record name="AudioRingBufferPrivate" c:type="GstAudioRingBufferPrivate" disguised="1">
+      <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h"/>
+    </record>
     <record name="AudioRingBufferSpec" c:type="GstAudioRingBufferSpec">
       <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioringbuffer.h">The structure containing the format specification of the ringbuffer.
 
@@ -10919,12 +10987,18 @@ string is not a known format.</doc>
       </return-value>
     </function>
     <function name="audio_format_to_string" c:identifier="gst_audio_format_to_string" moved-to="AudioFormat.to_string">
+      <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">Returns a string containing a descriptive name for the #GstAudioFormat.
+
+Since 1.26 this can also be used with %GST_AUDIO_FORMAT_UNKNOWN, previous
+versions were printing a critical warning and returned %NULL.</doc>
       <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.h"/>
       <return-value transfer-ownership="none">
+        <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">the name corresponding to @format</doc>
         <type name="utf8" c:type="const gchar*"/>
       </return-value>
       <parameters>
         <parameter name="format" transfer-ownership="none">
+          <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-format.c">a #GstAudioFormat audio format</doc>
           <type name="AudioFormat" c:type="GstAudioFormat"/>
         </parameter>
       </parameters>
@@ -11691,6 +11765,16 @@ the #GstDsdFormat if there is one, or NULL otherwise.</doc>
         <type name="Gst.MetaInfo" c:type="const GstMetaInfo*"/>
       </return-value>
     </function>
+    <docsection name="gstaudio">
+      <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio.c">This library contains some helper functions for audio elements.</doc>
+    </docsection>
+    <docsection name="gstaudiochannels">
+      <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/audio-channels.c">This library contains some helper functions for multichannel audio.</doc>
+    </docsection>
+    <docsection name="gstaudioiec61937">
+      <doc xml:space="preserve" filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudioiec61937.c">This module contains some helper functions for encapsulating various
+audio formats in IEC 61937 headers and padding.</doc>
+    </docsection>
     <function name="stream_volume_convert_volume" c:identifier="gst_stream_volume_convert_volume" moved-to="StreamVolume.convert_volume">
       <source-position filename="../subprojects/gst-plugins-base/gst-libs/gst/audio/streamvolume.h"/>
       <return-value transfer-ownership="none">

@@ -21,16 +21,16 @@
 #include <config.h>
 #endif
 
+#include "gstd3d12plugin-config.h"
+
 #include "gstd3d12decoder.h"
-#include "gstd3d12device.h"
-#include "gstd3d12utils.h"
-#include "gstd3d12format.h"
-#include "gstd3d12memory.h"
-#include "gstd3d12bufferpool.h"
-#include "gstd3d12fence.h"
+#include "gstd3d12decodercpbpool.h"
+#include <directx/d3dx12.h>
+#include <gst/base/gstqueuearray.h>
 #include <wrl.h>
 #include <string.h>
 #include <mutex>
+#include <condition_variable>
 #include <set>
 #include <vector>
 #include <queue>
@@ -38,9 +38,28 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <atomic>
 
-GST_DEBUG_CATEGORY_EXTERN (gst_d3d12_decoder_debug);
-#define GST_CAT_DEFAULT gst_d3d12_decoder_debug
+#ifdef HAVE_GST_D3D11
+#include <d3d11_4.h>
+#include <gst/d3d11/gstd3d11.h>
+#include <gst/d3d11/gstd3d11-private.h>
+#endif
+
+#ifndef GST_DISABLE_GST_DEBUG
+#define GST_CAT_DEFAULT ensure_debug_category()
+static GstDebugCategory *
+ensure_debug_category (void)
+{
+  static GstDebugCategory *cat = nullptr;
+
+  GST_D3D12_CALL_ONCE_BEGIN {
+    cat = _gst_debug_category_new ("d3d12decoder", 0, "d3d12decoder");
+  } GST_D3D12_CALL_ONCE_END;
+
+  return cat;
+}
+#endif /* GST_DISABLE_GST_DEBUG */
 
 struct DecoderFormat
 {
@@ -50,12 +69,18 @@ struct DecoderFormat
 };
 
 static const DecoderFormat format_list[] = {
+  {GST_DXVA_CODEC_MPEG2, D3D12_VIDEO_DECODE_PROFILE_MPEG2,
+      {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
+  {GST_DXVA_CODEC_MPEG2, D3D12_VIDEO_DECODE_PROFILE_MPEG1_AND_MPEG2,
+      {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
   {GST_DXVA_CODEC_H264, D3D12_VIDEO_DECODE_PROFILE_H264,
       {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
   {GST_DXVA_CODEC_H265, D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN,
       {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
   {GST_DXVA_CODEC_H265, D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10,
       DXGI_FORMAT_P010},
+  {GST_DXVA_CODEC_VP8, D3D12_VIDEO_DECODE_PROFILE_VP8,
+      {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
   {GST_DXVA_CODEC_VP9, D3D12_VIDEO_DECODE_PROFILE_VP9,
       {DXGI_FORMAT_NV12, DXGI_FORMAT_UNKNOWN,}},
   {GST_DXVA_CODEC_VP9, D3D12_VIDEO_DECODE_PROFILE_VP9_10BIT_PROFILE2,
@@ -86,9 +111,9 @@ public:
 
   guint8 Acquire (GstD3D12Memory * mem, ID3D12VideoDecoderHeap * heap)
   {
-    std::lock_guard <std::mutex> lk (lock_);
-    if (dxva_id_.empty ())
-      return 0xff;
+    std::unique_lock <std::mutex> lk (lock_);
+    while (dxva_id_.empty ())
+      cond_.wait (lk);
 
     guint8 ret = dxva_id_.front ();
     dxva_id_.pop ();
@@ -111,54 +136,56 @@ public:
   void Release (guint8 id)
   {
     std::lock_guard <std::mutex> lk (lock_);
-    if (id == 0xff || id >= size_)
+
+    if (id == 0xff || id >= size_) {
+      GST_WARNING ("Unexpected id %d", id);
       return;
+    }
 
     dxva_id_.push (id);
-
     textures_[id] = nullptr;
     subresources_[id] = 0;
     heaps_[id] = nullptr;
+
+    cond_.notify_one ();
   }
 
-  guint8 GetSize ()
+  void GetReferenceFrames (D3D12_VIDEO_DECODE_REFERENCE_FRAMES & frames)
   {
-    return size_;
+    frames.NumTexture2Ds = size_;
+    frames.ppTexture2Ds = textures_.data ();
+    frames.pSubresources = subresources_.data ();
+    frames.ppHeaps = heaps_.data ();
   }
 
-  ID3D12Resource ** GetTextures ()
+  void Lock ()
   {
-    return &textures_[0];
+    lock_.lock ();
   }
 
-  UINT * GetSubresources ()
+  void Unlock ()
   {
-    return &subresources_[0];
-  }
-
-  ID3D12VideoDecoderHeap ** GetHeaps ()
-  {
-    return &heaps_[0];
+    lock_.unlock ();
   }
 
 private:
   std::queue<guint8> dxva_id_;
   std::mutex lock_;
+  std::condition_variable cond_;
   guint size_;
   std::vector<ID3D12Resource *> textures_;
   std::vector<UINT> subresources_;
   std::vector<ID3D12VideoDecoderHeap *> heaps_;
+  bool flushing = false;
 };
 
 struct GstD3D12DecoderPicture : public GstMiniObject
 {
   GstD3D12DecoderPicture (GstBuffer * dpb_buf, GstBuffer * out_buf,
-      std::shared_ptr<GstD3D12Dpb> d3d12_dpb,
+      std::shared_ptr<GstD3D12Dpb> d3d12_dpb, ID3D12VideoDecoder * dec,
       ID3D12VideoDecoderHeap * decoder_heap, guint8 dxva_id)
-      : buffer(dpb_buf), output_buffer(out_buf), dpb(d3d12_dpb)
-      , heap(decoder_heap), view_id(dxva_id)
-  {
-  }
+      : buffer(dpb_buf), output_buffer(out_buf)
+      , decoder(dec), heap(decoder_heap), dpb(d3d12_dpb), view_id(dxva_id) {}
 
   ~GstD3D12DecoderPicture ()
   {
@@ -174,37 +201,71 @@ struct GstD3D12DecoderPicture : public GstMiniObject
 
   GstBuffer *buffer;
   GstBuffer *output_buffer;
+  ComPtr<ID3D12VideoDecoder> decoder;
   ComPtr<ID3D12VideoDecoderHeap> heap;
   std::weak_ptr<GstD3D12Dpb> dpb;
+  guint64 fence_val = 0;
 
   guint8 view_id;
 };
 
+static GType gst_d3d12_decoder_picture_get_type (void);
 #define GST_TYPE_D3D12_DECODER_PICTURE (gst_d3d12_decoder_picture_get_type ())
 GST_DEFINE_MINI_OBJECT_TYPE (GstD3D12DecoderPicture, gst_d3d12_decoder_picture);
 
-typedef enum
+enum GstD3D12DecoderOutputType
 {
-  GST_D3D12_DECODER_OUTPUT_D3D12,
-  GST_D3D12_DECODER_OUTPUT_D3D11,
-  GST_D3D12_DECODER_OUTPUT_SYSTEM,
-} GstD3D12DecoderOutputType;
+  GST_D3D12_DECODER_OUTPUT_UNKNOWN = 0,
+  GST_D3D12_DECODER_OUTPUT_SYSTEM = (1 << 0),
+  GST_D3D12_DECODER_OUTPUT_D3D12 = (1 << 1),
+  GST_D3D12_DECODER_OUTPUT_D3D11 = (1 << 2),
+};
 
-struct GstD3D12DecoderPrivate
+DEFINE_ENUM_FLAG_OPERATORS (GstD3D12DecoderOutputType);
+
+constexpr UINT64 ASYNC_DEPTH = 4;
+
+struct DecoderCmdData
 {
-  ~GstD3D12DecoderPrivate()
+  ComPtr<ID3D12Device> device;
+  ComPtr<ID3D12VideoDevice> video_device;
+  ComPtr<ID3D12VideoDecodeCommandList> cl;
+  GstD3D12CmdQueue *queue = nullptr;
+  bool need_full_drain = false;
+
+  /* Fence to wait at command record thread */
+  UINT64 fence_val = 0;
+
+#ifdef HAVE_GST_D3D11
+  ComPtr<ID3D11Device5> device11_5;
+  ComPtr<ID3D11DeviceContext4> context11_4;
+  ComPtr<ID3D11Fence> fence11;
+  ComPtr<ID3D12Fence> fence12;
+
+  UINT64 fence_val_11 = 0;
+#endif
+};
+
+struct DecoderOutputData
+{
+  GstVideoDecoder *decoder = nullptr;
+  GstVideoCodecFrame *frame = nullptr;
+  GstCodecPicture *picture = nullptr;
+  gint width = 0;
+  gint height = 0;
+  GstVideoBufferFlags buffer_flags = (GstVideoBufferFlags) 0;
+};
+
+struct DecoderSessionData
+{
+  DecoderSessionData ()
   {
-    if (input_state)
-      gst_video_codec_state_unref (input_state);
+    output_queue = gst_vec_deque_new_for_struct (sizeof (DecoderOutputData),
+        16);
+  }
 
-    if (output_state)
-      gst_video_codec_state_unref (output_state);
-
-    if (fence) {
-      gst_d3d12_fence_wait (fence);
-      gst_d3d12_fence_unref (fence);
-    }
-
+  ~DecoderSessionData ()
+  {
     if (dpb_pool) {
       gst_buffer_pool_set_active (dpb_pool, FALSE);
       gst_object_unref (dpb_pool);
@@ -214,17 +275,40 @@ struct GstD3D12DecoderPrivate
       gst_buffer_pool_set_active (output_pool, FALSE);
       gst_object_unref (output_pool);
     }
+
+    if (input_state)
+      gst_video_codec_state_unref (input_state);
+
+    if (output_state)
+      gst_video_codec_state_unref (output_state);
+
+    gst_vec_deque_free (output_queue);
+    gst_clear_object (&cpb_pool);
   }
 
-  /* reference textures */
+  D3D12_VIDEO_DECODER_DESC decoder_desc = {};
+  ComPtr<ID3D12VideoDecoder> decoder;
+
+  D3D12_VIDEO_DECODER_HEAP_DESC heap_desc = {};
+  ComPtr<ID3D12VideoDecoderHeap> heap;
+
+  std::shared_ptr<GstD3D12Dpb> dpb;
+
+  ComPtr<ID3D12Resource> staging;
+
   GstBufferPool *dpb_pool = nullptr;
 
   /* Used for output if reference-only texture is required */
   GstBufferPool *output_pool = nullptr;
 
-  gboolean configured = FALSE;
-  gboolean opened = FALSE;
-  gboolean flushing = FALSE;
+  GstD3D12DecoderCpbPool *cpb_pool = nullptr;
+
+  GstVideoCodecState *input_state = nullptr;
+  GstVideoCodecState *output_state = nullptr;
+
+  gint aligned_width = 0;
+  gint aligned_height = 0;
+  guint dpb_size = 0;
 
   GstVideoInfo info;
   GstVideoInfo output_info;
@@ -233,51 +317,53 @@ struct GstD3D12DecoderPrivate
   gint coded_width = 0;
   gint coded_height = 0;
   DXGI_FORMAT decoder_format = DXGI_FORMAT_UNKNOWN;
-  gboolean reference_only = FALSE;
-  gboolean use_array_of_texture = FALSE;
+  bool need_crop = false;
+  bool use_crop_meta = false;
+  bool array_of_textures = false;
+  bool reference_only = false;
+
   GstD3D12DecoderOutputType output_type = GST_D3D12_DECODER_OUTPUT_SYSTEM;
-  guint downstream_min_buffers = 0;
-  gboolean need_crop = FALSE;
-  gboolean use_crop_meta = FALSE;
-  gboolean wait_on_pool_full = FALSE;
 
   D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT support = { 0, };
 
   /* For staging */
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout[GST_VIDEO_MAX_PLANES] = { 0, };
 
-  GstVideoCodecState *input_state = nullptr;
-  GstVideoCodecState *output_state = nullptr;
+  std::mutex queue_lock;
+  std::condition_variable queue_cond;
+  GstVecDeque *output_queue;
 
-  /* Internal pool params */
-  gint aligned_width = 0;
-  gint aligned_height = 0;
-  guint dpb_size = 0;
+  std::recursive_mutex lock;
+};
 
-  ComPtr<ID3D12VideoDevice> video_device;
+struct GstD3D12DecoderPrivate
+{
+  GstD3D12DecoderPrivate ()
+  {
+    fence_data_pool = gst_d3d12_fence_data_pool_new ();
+  }
 
-  ComPtr<ID3D12VideoDecoder> decoder;
-  ComPtr<ID3D12VideoDecoderHeap> heap;
-  ComPtr<ID3D12CommandAllocator> ca;
-  ComPtr<ID3D12VideoDecodeCommandList> cl;
-  ComPtr<ID3D12CommandQueue> cq;
-  ComPtr<ID3D12Resource> bitstream;
-  gsize bitstream_size = 0;
-
-  std::shared_ptr<GstD3D12Dpb> dpb;
-
-  /* Used for download decoded picture to staging */
-  ComPtr<ID3D12CommandAllocator> copy_ca;
-  ComPtr<ID3D12GraphicsCommandList> copy_cl;
-
-  ComPtr<ID3D12Resource> staging;
-
-  GstD3D12Fence *fence = nullptr;
-
-  gint64 luid;
+  ~GstD3D12DecoderPrivate ()
+  {
+    gst_clear_object (&fence_data_pool);
+  }
 
   std::mutex lock;
+  std::recursive_mutex context_lock;
+
+  std::unique_ptr<DecoderCmdData> cmd;
+  std::unique_ptr<DecoderSessionData> session;
+  GThread *output_thread = nullptr;
+  std::atomic<bool> flushing;
+  std::atomic<GstFlowReturn> last_flow;
+
+  GstD3D12FenceDataPool *fence_data_pool;
+
+  std::vector<D3D12_RESOURCE_BARRIER> pre_barriers;
+  std::vector<D3D12_RESOURCE_BARRIER> post_barriers;
+  std::vector < GstD3D12DecoderPicture * >configured_ref_pics;
 };
+
 /* *INDENT-ON* */
 
 struct _GstD3D12Decoder
@@ -286,15 +372,18 @@ struct _GstD3D12Decoder
 
   GstDxvaCodec codec;
   GstD3D12Device *device;
-  GstD3D11Device *d3d11_device;
   gint64 adapter_luid;
+  gboolean d3d11_interop;
 
-  CRITICAL_SECTION context_lock;
+#ifdef HAVE_GST_D3D11
+  GstD3D11Device *device11;
+#endif
 
   GstD3D12DecoderPrivate *priv;
 };
 
 static void gst_d3d12_decoder_finalize (GObject * object);
+static gpointer gst_d3d12_decoder_output_loop (GstD3D12Decoder * self);
 
 #define parent_class gst_d3d12_decoder_parent_class
 G_DEFINE_TYPE (GstD3D12Decoder, gst_d3d12_decoder, GST_TYPE_OBJECT);
@@ -310,68 +399,35 @@ gst_d3d12_decoder_class_init (GstD3D12DecoderClass * klass)
 static void
 gst_d3d12_decoder_init (GstD3D12Decoder * self)
 {
-  InitializeCriticalSection (&self->context_lock);
+  self->priv = new GstD3D12DecoderPrivate ();
 }
 
 static void
 gst_d3d12_decoder_finalize (GObject * object)
 {
-  GstD3D12Decoder *self = GST_D3D12_DECODER (object);
+  auto self = GST_D3D12_DECODER (object);
 
-  gst_d3d12_decoder_close (self);
-  DeleteCriticalSection (&self->context_lock);
+  gst_clear_object (&self->device);
+#ifdef HAVE_GST_D3D11
+  gst_clear_object (&self->device11);
+#endif
+
+  delete self->priv;
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
-static void
-gst_d3d12_decoder_clear_resource (GstD3D12Decoder * self)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-  std::lock_guard < std::mutex > lk (priv->lock);
-
-  gst_d3d12_fence_wait (priv->fence);
-
-  if (priv->dpb_pool) {
-    gst_buffer_pool_set_active (priv->dpb_pool, FALSE);
-    gst_clear_object (&priv->dpb_pool);
-  }
-
-  if (priv->output_pool) {
-    gst_buffer_pool_set_active (priv->output_pool, FALSE);
-    gst_clear_object (&priv->output_pool);
-  }
-
-  priv->heap = nullptr;
-  priv->staging = nullptr;
-}
-
-static void
-gst_d3d12_decoder_reset (GstD3D12Decoder * self)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-
-  gst_d3d12_decoder_clear_resource (self);
-  priv->dpb_size = 0;
-
-  priv->configured = FALSE;
-  priv->opened = FALSE;
-
-  g_clear_pointer (&priv->output_state, gst_video_codec_state_unref);
-  g_clear_pointer (&priv->input_state, gst_video_codec_state_unref);
-}
-
 GstD3D12Decoder *
-gst_d3d12_decoder_new (GstDxvaCodec codec, gint64 adapter_luid)
+gst_d3d12_decoder_new (const GstD3D12DecoderSubClassData * cdata)
 {
   GstD3D12Decoder *self;
 
-  g_return_val_if_fail (codec > GST_DXVA_CODEC_NONE, nullptr);
-  g_return_val_if_fail (codec < GST_DXVA_CODEC_LAST, nullptr);
+  g_return_val_if_fail (cdata, nullptr);
 
   self = (GstD3D12Decoder *) g_object_new (GST_TYPE_D3D12_DECODER, nullptr);
-  self->codec = codec;
-  self->adapter_luid = adapter_luid;
+  self->codec = cdata->codec;
+  self->adapter_luid = cdata->adapter_luid;
+  self->d3d11_interop = cdata->d3d11_interop;
 
   return self;
 }
@@ -379,75 +435,82 @@ gst_d3d12_decoder_new (GstDxvaCodec codec, gint64 adapter_luid)
 gboolean
 gst_d3d12_decoder_open (GstD3D12Decoder * decoder, GstElement * element)
 {
-  if (!gst_d3d12_ensure_element_data_for_adapter_luid (element,
-          decoder->adapter_luid, &decoder->device)) {
-    GST_ERROR_OBJECT (element, "Cannot create d3d12device");
+  auto priv = decoder->priv;
+
+  {
+    std::lock_guard < std::recursive_mutex > lk (priv->context_lock);
+    if (!gst_d3d12_ensure_element_data_for_adapter_luid (element,
+            decoder->adapter_luid, &decoder->device)) {
+      GST_ERROR_OBJECT (element, "Cannot create d3d12device");
+      return FALSE;
+    }
+  }
+
+  auto cmd = std::make_unique < DecoderCmdData > ();
+  HRESULT hr;
+
+  cmd->device = gst_d3d12_device_get_device_handle (decoder->device);
+
+  hr = cmd->device.As (&cmd->video_device);
+  if (!gst_d3d12_result (hr, decoder->device)) {
+    GST_ERROR_OBJECT (element, "ID3D12VideoDevice interface is unavailable");
     return FALSE;
   }
 
-  if (!decoder->priv) {
-    GstD3D12DecoderPrivate *priv;
-    ComPtr < ID3D12VideoDevice > video_device;
-    ComPtr < ID3D12CommandAllocator > copy_ca;
-    ComPtr < ID3D12GraphicsCommandList > copy_cl;
-    ComPtr < ID3D12CommandAllocator > ca;
-    ComPtr < ID3D12VideoDecodeCommandList > cl;
-    ComPtr < ID3D12CommandQueue > cq;
-    ID3D12Device *device_handle;
-    D3D12_COMMAND_QUEUE_DESC desc = { };
-    HRESULT hr;
-
-    device_handle = gst_d3d12_device_get_device_handle (decoder->device);
-    hr = device_handle->QueryInterface (IID_PPV_ARGS (&video_device));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = device_handle->CreateCommandAllocator (D3D12_COMMAND_LIST_TYPE_COPY,
-        IID_PPV_ARGS (&copy_ca));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = device_handle->CreateCommandList (0, D3D12_COMMAND_LIST_TYPE_COPY,
-        copy_ca.Get (), nullptr, IID_PPV_ARGS (&copy_cl));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = copy_cl->Close ();
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = device_handle->CreateCommandAllocator
-        (D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, IID_PPV_ARGS (&ca));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = device_handle->CreateCommandList (0,
-        D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE, ca.Get (), nullptr,
-        IID_PPV_ARGS (&cl));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    hr = cl->Close ();
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE;
-    desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    hr = device_handle->CreateCommandQueue (&desc, IID_PPV_ARGS (&cq));
-    if (!gst_d3d12_result (hr, decoder->device))
-      return FALSE;
-
-    priv = new GstD3D12DecoderPrivate ();
-    priv->fence = gst_d3d12_fence_new (decoder->device);
-    priv->video_device = video_device;
-    priv->copy_ca = copy_ca;
-    priv->copy_cl = copy_cl;
-    priv->ca = ca;
-    priv->cl = cl;
-    priv->cq = cq;
-
-    decoder->priv = priv;
+  cmd->queue = gst_d3d12_device_get_decode_queue (decoder->device);
+  if (!cmd->queue) {
+    GST_ERROR_OBJECT (element, "Couldn't create command queue");
+    return FALSE;
   }
+
+  auto flags = gst_d3d12_device_get_workaround_flags (decoder->device);
+  if ((flags & GST_D3D12_WA_DECODER_RACE) == GST_D3D12_WA_DECODER_RACE)
+    cmd->need_full_drain = true;
+
+  priv->cmd = std::move (cmd);
+  priv->flushing = false;
+
+  return TRUE;
+}
+
+GstFlowReturn
+gst_d3d12_decoder_drain (GstD3D12Decoder * decoder, GstVideoDecoder * videodec)
+{
+  auto priv = decoder->priv;
+
+  GST_DEBUG_OBJECT (decoder, "Draining");
+  if (priv->cmd)
+    gst_d3d12_cmd_queue_fence_wait (priv->cmd->queue, priv->cmd->fence_val);
+
+  GST_VIDEO_DECODER_STREAM_UNLOCK (videodec);
+  if (priv->output_thread && priv->session) {
+    auto empty_data = DecoderOutputData ();
+    std::lock_guard < std::mutex > lk (priv->session->queue_lock);
+    gst_vec_deque_push_tail_struct (priv->session->output_queue, &empty_data);
+    priv->session->queue_cond.notify_one ();
+  }
+
+  g_clear_pointer (&priv->output_thread, g_thread_join);
+  GST_VIDEO_DECODER_STREAM_LOCK (videodec);
+
+  GST_DEBUG_OBJECT (decoder, "Drain done");
+
+  return GST_FLOW_OK;
+}
+
+gboolean
+gst_d3d12_decoder_flush (GstD3D12Decoder * decoder, GstVideoDecoder * videodec)
+{
+  auto priv = decoder->priv;
+
+  GST_DEBUG_OBJECT (decoder, "Flushing");
+
+  priv->flushing = true;
+  gst_d3d12_decoder_drain (decoder, videodec);
+  priv->flushing = false;
+  priv->last_flow = GST_FLOW_OK;
+
+  GST_DEBUG_OBJECT (decoder, "Flush done");
 
   return TRUE;
 }
@@ -455,20 +518,25 @@ gst_d3d12_decoder_open (GstD3D12Decoder * decoder, GstElement * element)
 gboolean
 gst_d3d12_decoder_close (GstD3D12Decoder * decoder)
 {
-  if (decoder->priv) {
-    delete decoder->priv;
-    decoder->priv = nullptr;
+  auto priv = decoder->priv;
+
+  GST_DEBUG_OBJECT (decoder, "Close");
+
+  {
+    GstD3D12DeviceDecoderLockGuard lk (decoder->device);
+    priv->session = nullptr;
+    priv->cmd = nullptr;
   }
 
   gst_clear_object (&decoder->device);
-  gst_clear_object (&decoder->d3d11_device);
 
   return TRUE;
 }
 
 GstFlowReturn
 gst_d3d12_decoder_configure (GstD3D12Decoder * decoder,
-    GstVideoCodecState * input_state, const GstVideoInfo * info,
+    GstVideoDecoder * videodec, GstVideoCodecState * input_state,
+    const GstVideoInfo * info,
     gint crop_x, gint crop_y, gint coded_width,
     gint coded_height, guint dpb_size)
 {
@@ -481,15 +549,28 @@ gst_d3d12_decoder_configure (GstD3D12Decoder * decoder,
       GST_FLOW_ERROR);
   g_return_val_if_fail (dpb_size > 0, GST_FLOW_ERROR);
 
-  GstD3D12DecoderPrivate *priv = decoder->priv;
-  GstD3D12Format device_format;
-
-  if (!priv) {
-    GST_ERROR_OBJECT (decoder, "Device is not configured");
+  if (!decoder->device) {
+    GST_ERROR_OBJECT (decoder, "Device was not configured");
     return GST_FLOW_ERROR;
   }
 
-  gst_d3d12_decoder_reset (decoder);
+  GstD3D12DeviceDecoderLockGuard dlk (decoder->device);
+
+  GstD3D12Format device_format;
+  auto priv = decoder->priv;
+  HRESULT hr;
+
+  D3D12_VIDEO_DECODER_DESC prev_desc = { };
+  ComPtr < ID3D12VideoDecoder > prev_decoder;
+
+  /* Store previous encoder object and reuse if possible */
+  if (priv->session) {
+    prev_desc = priv->session->decoder_desc;
+    prev_decoder = priv->session->decoder;
+  }
+
+  gst_d3d12_decoder_drain (decoder, videodec);
+  priv->session = nullptr;
 
   if (!gst_d3d12_device_get_format (decoder->device,
           GST_VIDEO_INFO_FORMAT (info), &device_format) ||
@@ -502,124 +583,266 @@ gst_d3d12_decoder_configure (GstD3D12Decoder * decoder,
   if (decoder->codec == GST_DXVA_CODEC_H264)
     dpb_size += 1;
 
-  priv->input_state = gst_video_codec_state_ref (input_state);
-  priv->info = priv->output_info = *info;
-  priv->crop_x = crop_x;
-  priv->crop_y = crop_y;
-  priv->coded_width = coded_width;
-  priv->coded_height = coded_height;
-  priv->dpb_size = dpb_size;
-  priv->decoder_format = device_format.dxgi_format;
+  /* +2 for threading */
+  dpb_size += 2;
+
+  dpb_size = MAX (dpb_size, ASYNC_DEPTH);
+
+  auto session = std::make_unique < DecoderSessionData > ();
+  session->input_state = gst_video_codec_state_ref (input_state);
+  session->info = *info;
+  session->output_info = *info;
+  session->crop_x = crop_x;
+  session->crop_y = crop_y;
+  session->coded_width = coded_width;
+  session->coded_height = coded_height;
+  session->dpb_size = dpb_size;
+  session->decoder_format = device_format.dxgi_format;
+  session->cpb_pool = gst_d3d12_decoder_cpb_pool_new (priv->cmd->device.Get ());
 
   if (crop_x != 0 || crop_y != 0)
-    priv->need_crop = TRUE;
-  else
-    priv->need_crop = FALSE;
+    session->need_crop = true;
 
-  priv->configured = TRUE;
+  bool supported = false;
+  for (guint i = 0; i < G_N_ELEMENTS (format_list); i++) {
+    const DecoderFormat *decoder_format = nullptr;
+    if (format_list[i].codec != decoder->codec)
+      continue;
 
-  return GST_FLOW_OK;
-}
+    for (guint j = 0; j < G_N_ELEMENTS (format_list[i].format); j++) {
+      DXGI_FORMAT format = format_list[i].format[j];
 
-static gboolean
-gst_d3d12_decoder_prepare_pool (GstD3D12Decoder * self)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-  GstVideoInfo *info = &priv->info;
-  GstVideoAlignment align;
-  GstD3D12AllocationParams *params;
-  GstStructure *config;
-  GstCaps *caps;
+      if (format == DXGI_FORMAT_UNKNOWN)
+        break;
 
-  GST_DEBUG_OBJECT (self, "Preparing allocator");
+      if (format == session->decoder_format) {
+        decoder_format = &format_list[i];
+        break;
+      }
+    }
 
-  std::lock_guard < std::mutex > lk (priv->lock);
-  if (priv->dpb_pool) {
-    gst_buffer_pool_set_active (priv->dpb_pool, FALSE);
-    gst_clear_object (&priv->dpb_pool);
+    if (!decoder_format)
+      continue;
+
+    D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT support = { };
+    support.Configuration.DecodeProfile = decoder_format->decode_profile;
+    support.Configuration.BitstreamEncryption =
+        D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE;
+
+    if (GST_VIDEO_INFO_IS_INTERLACED (info) &&
+        GST_VIDEO_INFO_INTERLACE_MODE (info) !=
+        GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
+      support.Configuration.InterlaceType =
+          D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED;
+    } else {
+      support.Configuration.InterlaceType =
+          D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
+    }
+
+    support.DecodeFormat = session->decoder_format;
+    support.FrameRate = { 0, 1 };
+    support.Width = coded_width;
+    support.Height = coded_height;
+    hr = priv->cmd->
+        video_device->CheckFeatureSupport (D3D12_FEATURE_VIDEO_DECODE_SUPPORT,
+        &support, sizeof (support));
+    if (FAILED (hr))
+      continue;
+
+    if ((support.SupportFlags & D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED) == 0)
+      continue;
+
+    session->support = support;
+    supported = true;
+    break;
   }
 
-  if (priv->output_pool) {
-    gst_buffer_pool_set_active (priv->output_pool, FALSE);
-    gst_clear_object (&priv->output_pool);
+  if (!supported) {
+    GST_ERROR_OBJECT (decoder,
+        "Decoder does not support current configuration");
+    return GST_FLOW_ERROR;
   }
 
-  D3D12_RESOURCE_FLAGS resource_flags;
-  if ((priv->support.ConfigurationFlags &
-          D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_REFERENCE_ONLY_ALLOCATIONS_REQUIRED)
+  const auto & support = session->support;
+  guint alignment = 16;
+  if ((support.ConfigurationFlags &
+          D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED)
       != 0) {
-    resource_flags =
-        D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY |
-        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
-    priv->reference_only = TRUE;
-  } else {
-    resource_flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
-    priv->reference_only = FALSE;
+    alignment = 32;
   }
 
-  GstD3D12AllocationFlags alloc_flags = GST_D3D12_ALLOCATION_FLAG_DEFAULT;
-  guint max_buffers = priv->dpb_size;
-  /* Tier 1 decoder requires array */
-  if (priv->support.DecodeTier == D3D12_VIDEO_DECODE_TIER_1) {
-    priv->use_array_of_texture = FALSE;
-    alloc_flags = GST_D3D12_ALLOCATION_FLAG_TEXTURE_ARRAY;
+  session->aligned_width = GST_ROUND_UP_N (session->coded_width, alignment);
+  session->aligned_height = GST_ROUND_UP_N (session->coded_height, alignment);
+
+  if (prev_decoder && prev_desc.Configuration.DecodeProfile ==
+      support.Configuration.DecodeProfile &&
+      prev_desc.Configuration.InterlaceType ==
+      support.Configuration.InterlaceType) {
+    session->decoder = prev_decoder;
+    session->decoder_desc = prev_desc;
   } else {
-    priv->use_array_of_texture = TRUE;
+    D3D12_VIDEO_DECODER_DESC desc;
+
+    desc.NodeMask = 0;
+    desc.Configuration = support.Configuration;
+    hr = priv->cmd->video_device->CreateVideoDecoder (&desc,
+        IID_PPV_ARGS (&session->decoder));
+    if (!gst_d3d12_result (hr, decoder->device)) {
+      GST_ERROR_OBJECT (decoder, "Couldn't create decoder object");
+      return GST_FLOW_ERROR;
+    }
+
+    session->decoder_desc = desc;
+  }
+
+  D3D12_VIDEO_DECODER_HEAP_DESC heap_desc;
+  heap_desc.NodeMask = 0;
+  heap_desc.Configuration = session->support.Configuration;
+  heap_desc.DecodeWidth = session->aligned_width;
+  heap_desc.DecodeHeight = session->aligned_height;
+  heap_desc.Format = session->decoder_format;
+  heap_desc.FrameRate = { 0, 1 };
+  heap_desc.BitRate = 0;
+  heap_desc.MaxDecodePictureBufferCount = session->dpb_size;
+  hr = priv->cmd->video_device->CreateVideoDecoderHeap (&heap_desc,
+      IID_PPV_ARGS (&session->heap));
+  if (!gst_d3d12_result (hr, decoder->device)) {
+    GST_ERROR_OBJECT (decoder, "Couldn't create decoder heap");
+    return GST_FLOW_ERROR;
+  }
+
+  guint max_buffers = session->dpb_size;
+  if (support.DecodeTier == D3D12_VIDEO_DECODE_TIER_1) {
+    session->array_of_textures = false;
+  } else {
+    session->array_of_textures = true;
     max_buffers = 0;
   }
 
-  params = gst_d3d12_allocation_params_new (self->device, info, alloc_flags,
-      resource_flags);
+  D3D12_RESOURCE_FLAGS resource_flags;
+  if ((support.ConfigurationFlags &
+          D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_REFERENCE_ONLY_ALLOCATIONS_REQUIRED)
+      != 0 || !session->array_of_textures) {
+    resource_flags =
+        D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY |
+        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    session->reference_only = true;
+  } else {
+    resource_flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    session->reference_only = false;
+  }
 
+  GST_DEBUG_OBJECT (decoder, "reference only: %d, array-of-textures: %d",
+      session->reference_only, session->array_of_textures);
+
+  GstVideoAlignment align;
   gst_video_alignment_reset (&align);
-  align.padding_right = priv->aligned_width - GST_VIDEO_INFO_WIDTH (info);
-  align.padding_bottom = priv->aligned_height - GST_VIDEO_INFO_HEIGHT (info);
+  align.padding_right = session->aligned_width - info->width;
+  align.padding_bottom = session->aligned_height - info->height;
+
+  D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+  if (gst_d3d12_device_non_zeroed_supported (decoder->device))
+    heap_flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
+  if (!session->reference_only)
+    heap_flags |= D3D12_HEAP_FLAG_SHARED;
+
+  auto params = gst_d3d12_allocation_params_new (decoder->device, info,
+      GST_D3D12_ALLOCATION_FLAG_DEFAULT, resource_flags, heap_flags);
   gst_d3d12_allocation_params_alignment (params, &align);
+  if (!session->array_of_textures)
+    gst_d3d12_allocation_params_set_array_size (params, session->dpb_size);
 
-  if (!priv->use_array_of_texture)
-    params->desc[0].DepthOrArraySize = (UINT16) max_buffers;
-
-  priv->dpb_pool = gst_d3d12_buffer_pool_new (self->device);
-  config = gst_buffer_pool_get_config (priv->dpb_pool);
-  caps = gst_video_info_to_caps (info);
+  session->dpb_pool = gst_d3d12_buffer_pool_new (decoder->device);
+  auto config = gst_buffer_pool_get_config (session->dpb_pool);
+  auto caps = gst_video_info_to_caps (info);
 
   gst_buffer_pool_config_set_d3d12_allocation_params (config, params);
   gst_d3d12_allocation_params_free (params);
-  gst_buffer_pool_config_set_params (config, caps, GST_VIDEO_INFO_SIZE (info),
-      0, max_buffers);
-  if (!gst_buffer_pool_set_config (priv->dpb_pool, config)) {
-    GST_ERROR_OBJECT (self, "Pool config failed");
+  gst_buffer_pool_config_set_params (config, caps, info->size, 0, max_buffers);
+  if (!gst_buffer_pool_set_config (session->dpb_pool, config)) {
+    GST_ERROR_OBJECT (decoder, "Couldn't set pool config");
     gst_caps_unref (caps);
-    return FALSE;
+    return GST_FLOW_ERROR;
   }
 
-  gst_buffer_pool_set_active (priv->dpb_pool, TRUE);
+  if (!gst_buffer_pool_set_active (session->dpb_pool, TRUE)) {
+    GST_ERROR_OBJECT (decoder, "Set active failed");
+    gst_caps_unref (caps);
+    return GST_FLOW_ERROR;
+  }
 
-  /* In case that device requires reference only dpb texture, we need another
-   * texture pool for outputting without VIDEO_DECODE_REFERENCE_ONLY flag */
-  if (priv->reference_only) {
-    GST_DEBUG_OBJECT (self, "Creating output only allocator");
-    priv->output_pool = gst_d3d12_buffer_pool_new (self->device);
-    config = gst_buffer_pool_get_config (priv->output_pool);
+  if (session->reference_only) {
+    GST_DEBUG_OBJECT (decoder, "Creating output only pool");
+    session->output_pool = gst_d3d12_buffer_pool_new (decoder->device);
+    config = gst_buffer_pool_get_config (session->output_pool);
 
-    params = gst_d3d12_allocation_params_new (self->device, info, alloc_flags,
-        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+    heap_flags = D3D12_HEAP_FLAG_NONE;
+    if (gst_d3d12_device_non_zeroed_supported (decoder->device))
+      heap_flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
+    params = gst_d3d12_allocation_params_new (decoder->device, info,
+        GST_D3D12_ALLOCATION_FLAG_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        heap_flags | D3D12_HEAP_FLAG_SHARED);
     gst_d3d12_allocation_params_alignment (params, &align);
     gst_buffer_pool_config_set_d3d12_allocation_params (config, params);
     gst_d3d12_allocation_params_free (params);
-    gst_buffer_pool_config_set_params (config, caps, GST_VIDEO_INFO_SIZE (info),
-        0, 0);
-    if (!gst_buffer_pool_set_config (priv->output_pool, config)) {
-      GST_ERROR_OBJECT (self, "Output pool config failed");
+    gst_buffer_pool_config_set_params (config, caps, info->size, 0, 0);
+
+    if (!gst_buffer_pool_set_config (session->output_pool, config)) {
+      GST_ERROR_OBJECT (decoder, "Couldn't set pool config");
       gst_caps_unref (caps);
-      return FALSE;
+      return GST_FLOW_ERROR;
     }
-    gst_buffer_pool_set_active (priv->output_pool, TRUE);
+
+    if (!gst_buffer_pool_set_active (session->output_pool, TRUE)) {
+      GST_ERROR_OBJECT (decoder, "Set active failed");
+      gst_caps_unref (caps);
+      return GST_FLOW_ERROR;
+    }
   }
 
   gst_caps_unref (caps);
 
-  priv->dpb = std::make_shared < GstD3D12Dpb > ((guint8) priv->dpb_size);
+  session->dpb = std::make_shared < GstD3D12Dpb > ((guint8) session->dpb_size);
+
+  priv->session = std::move (session);
+  priv->last_flow = GST_FLOW_OK;
+
+  return GST_FLOW_OK;
+}
+
+gboolean
+gst_d3d12_decoder_stop (GstD3D12Decoder * decoder)
+{
+  auto priv = decoder->priv;
+
+  GST_DEBUG_OBJECT (decoder, "Stop");
+
+  priv->flushing = true;
+  if (priv->cmd) {
+    if (priv->cmd->need_full_drain) {
+      gst_d3d12_cmd_queue_drain (priv->cmd->queue);
+    } else {
+      gst_d3d12_cmd_queue_fence_wait (priv->cmd->queue, priv->cmd->fence_val);
+    }
+  }
+
+  if (priv->output_thread && priv->session) {
+    auto empty_data = DecoderOutputData ();
+    std::lock_guard < std::mutex > lk (priv->session->queue_lock);
+    gst_vec_deque_push_tail_struct (priv->session->output_queue, &empty_data);
+    priv->session->queue_cond.notify_one ();
+  }
+
+  g_clear_pointer (&priv->output_thread, g_thread_join);
+  priv->flushing = false;
+
+  GstD3D12DeviceDecoderLockGuard lk (decoder->device);
+  priv->session = nullptr;
 
   return TRUE;
 }
@@ -632,13 +855,13 @@ gst_d3d12_decoder_picture_free (GstD3D12DecoderPicture * self)
 
 static GstD3D12DecoderPicture *
 gst_d3d12_decoder_picture_new (GstD3D12Decoder * self, GstBuffer * buffer,
-    GstBuffer * output_buffer, ID3D12VideoDecoderHeap * heap)
+    GstBuffer * output_buffer, ID3D12VideoDecoder * dec,
+    ID3D12VideoDecoderHeap * heap)
 {
-  GstD3D12DecoderPrivate *priv = self->priv;
-  GstD3D12DecoderPicture *picture;
-  GstMemory *mem = gst_buffer_peek_memory (buffer, 0);
+  auto priv = self->priv;
+  auto mem = (GstD3D12Memory *) gst_buffer_peek_memory (buffer, 0);
 
-  auto view_id = priv->dpb->Acquire (GST_D3D12_MEMORY_CAST (mem), heap);
+  auto view_id = priv->session->dpb->Acquire (mem, heap);
   if (view_id == 0xff) {
     GST_WARNING_OBJECT (self, "No empty picture");
     gst_buffer_unref (buffer);
@@ -647,8 +870,8 @@ gst_d3d12_decoder_picture_new (GstD3D12Decoder * self, GstBuffer * buffer,
     return nullptr;
   }
 
-  picture = new GstD3D12DecoderPicture (buffer, output_buffer, priv->dpb, heap,
-      view_id);
+  auto picture = new GstD3D12DecoderPicture (buffer, output_buffer,
+      priv->session->dpb, dec, heap, view_id);
 
   gst_mini_object_init (picture, 0, GST_TYPE_D3D12_DECODER_PICTURE,
       nullptr, nullptr,
@@ -661,51 +884,43 @@ GstFlowReturn
 gst_d3d12_decoder_new_picture (GstD3D12Decoder * decoder,
     GstVideoDecoder * videodec, GstCodecPicture * picture)
 {
-  GstD3D12DecoderPrivate *priv;
-  GstD3D12DecoderPicture *decoder_pic = nullptr;
-  GstBuffer *buffer;
-  GstBuffer *output_buffer = nullptr;
-  GstFlowReturn ret;
-
   g_return_val_if_fail (GST_IS_D3D12_DECODER (decoder), GST_FLOW_ERROR);
   g_return_val_if_fail (GST_IS_VIDEO_DECODER (videodec), GST_FLOW_ERROR);
   g_return_val_if_fail (picture != nullptr, GST_FLOW_ERROR);
 
-  priv = decoder->priv;
-
-  if (!priv->dpb_pool) {
-    /* Try negotiate again whatever the previous negotiation result was.
-     * There could be updated field(s) in sinkpad caps after we negotiated with
-     * downstream on new_sequence() call. For example, h264/h265 parse
-     * will be able to update HDR10 related caps field after parsing
-     * corresponding SEI messages which are usually placed after the essential
-     * headers */
-    gst_video_decoder_negotiate (videodec);
-
-    if (!gst_d3d12_decoder_prepare_pool (decoder)) {
-      GST_ERROR_OBJECT (videodec, "Failed to setup dpb pool");
-      return GST_FLOW_ERROR;
-    }
+  auto priv = decoder->priv;
+  if (!priv->session) {
+    GST_ERROR_OBJECT (decoder, "No session configured");
+    return GST_FLOW_ERROR;
   }
 
-  ret = gst_buffer_pool_acquire_buffer (priv->dpb_pool, &buffer, nullptr);
+  GST_VIDEO_DECODER_STREAM_UNLOCK (videodec);
+  GstBuffer *buffer;
+  auto ret = gst_buffer_pool_acquire_buffer (priv->session->dpb_pool,
+      &buffer, nullptr);
   if (ret != GST_FLOW_OK) {
     GST_WARNING_OBJECT (videodec, "Couldn't acquire memory");
+    GST_VIDEO_DECODER_STREAM_LOCK (videodec);
     return ret;
   }
 
-  if (priv->reference_only) {
-    ret = gst_buffer_pool_acquire_buffer (priv->output_pool,
+  GstBuffer *output_buffer = nullptr;
+  if (priv->session->reference_only) {
+    ret = gst_buffer_pool_acquire_buffer (priv->session->output_pool,
         &output_buffer, nullptr);
     if (ret != GST_FLOW_OK) {
       GST_WARNING_OBJECT (videodec, "Couldn't acquire output memory");
+      GST_VIDEO_DECODER_STREAM_LOCK (videodec);
       gst_buffer_unref (buffer);
       return ret;
     }
   }
 
-  decoder_pic = gst_d3d12_decoder_picture_new (decoder, buffer, output_buffer,
-      priv->heap.Get ());
+  /* unlock so that output thread can output picture and return
+   * back to dpb */
+  auto decoder_pic = gst_d3d12_decoder_picture_new (decoder, buffer,
+      output_buffer, priv->session->decoder.Get (), priv->session->heap.Get ());
+  GST_VIDEO_DECODER_STREAM_LOCK (videodec);
   if (!decoder_pic) {
     GST_ERROR_OBJECT (videodec, "Couldn't create new picture");
     return GST_FLOW_ERROR;
@@ -718,11 +933,44 @@ gst_d3d12_decoder_new_picture (GstD3D12Decoder * decoder,
 }
 
 GstFlowReturn
+gst_d3d12_decoder_new_picture_with_size (GstD3D12Decoder * decoder,
+    GstVideoDecoder * videodec, GstCodecPicture * picture, guint width,
+    guint height)
+{
+  g_return_val_if_fail (GST_IS_D3D12_DECODER (decoder), GST_FLOW_ERROR);
+  g_return_val_if_fail (GST_IS_VIDEO_DECODER (videodec), GST_FLOW_ERROR);
+  g_return_val_if_fail (picture != nullptr, GST_FLOW_ERROR);
+
+  auto priv = decoder->priv;
+  if (!priv->session) {
+    GST_ERROR_OBJECT (decoder, "No session configured");
+    return GST_FLOW_ERROR;
+  }
+
+  if (priv->session->coded_width >= width &&
+      priv->session->coded_height >= height) {
+    return gst_d3d12_decoder_new_picture (decoder, videodec, picture);
+  }
+
+  /* FIXME: D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_ALLOW_RESOLUTION_CHANGE_ON_NON_KEY_FRAME
+   * supported GPU can decode stream with mixed decoder heap */
+  GST_ERROR_OBJECT (decoder,
+      "Non-keyframe resolution change with larger size is not supported");
+
+  return GST_FLOW_ERROR;
+}
+
+static inline GstD3D12DecoderPicture *
+get_decoder_picture (GstCodecPicture * picture)
+{
+  return (GstD3D12DecoderPicture *) gst_codec_picture_get_user_data (picture);
+}
+
+GstFlowReturn
 gst_d3d12_decoder_duplicate_picture (GstD3D12Decoder * decoder,
     GstCodecPicture * src, GstCodecPicture * dst)
 {
-  GstD3D12DecoderPicture *decoder_pic =
-      (GstD3D12DecoderPicture *) gst_codec_picture_get_user_data (src);
+  auto decoder_pic = get_decoder_picture (src);
 
   if (!decoder_pic)
     return GST_FLOW_ERROR;
@@ -737,10 +985,11 @@ guint8
 gst_d3d12_decoder_get_picture_id (GstD3D12Decoder * decoder,
     GstCodecPicture * picture)
 {
-  GstD3D12DecoderPicture *decoder_pic =
-      (GstD3D12DecoderPicture *) gst_codec_picture_get_user_data (picture);
-
   if (!picture)
+    return 0xff;
+
+  auto decoder_pic = get_decoder_picture (picture);
+  if (!decoder_pic)
     return 0xff;
 
   return decoder_pic->view_id;
@@ -750,8 +999,7 @@ GstFlowReturn
 gst_d3d12_decoder_start_picture (GstD3D12Decoder * decoder,
     GstCodecPicture * picture, guint8 * picture_id)
 {
-  GstD3D12DecoderPicture *decoder_pic =
-      (GstD3D12DecoderPicture *) gst_codec_picture_get_user_data (picture);
+  auto decoder_pic = get_decoder_picture (picture);
 
   if (picture_id)
     *picture_id = 0xff;
@@ -765,59 +1013,12 @@ gst_d3d12_decoder_start_picture (GstD3D12Decoder * decoder,
   return GST_FLOW_OK;
 }
 
-static gboolean
-gst_d3d12_decoder_upload_bitstream (GstD3D12Decoder * self, gpointer data,
-    gsize size)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-  gpointer map_data;
-  HRESULT hr;
-
-  if (priv->bitstream && priv->bitstream_size < size)
-    priv->bitstream = nullptr;
-
-  if (!priv->bitstream) {
-    ID3D12Device *device_handle =
-        gst_d3d12_device_get_device_handle (self->device);
-    ComPtr < ID3D12Resource > bitstream;
-    size_t alloc_size = GST_ROUND_UP_128 (size) + 1024;
-
-    D3D12_HEAP_PROPERTIES heap_prop =
-        CD3D12_HEAP_PROPERTIES (D3D12_HEAP_TYPE_UPLOAD);
-    D3D12_RESOURCE_DESC desc = CD3D12_RESOURCE_DESC::Buffer (alloc_size);
-    hr = device_handle->CreateCommittedResource (&heap_prop,
-        D3D12_HEAP_FLAG_NONE, &desc,
-        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS (&bitstream));
-    if (!gst_d3d12_result (hr, self->device)) {
-      GST_ERROR_OBJECT (self, "Failed to create bitstream buffer");
-      return FALSE;
-    }
-
-    GST_LOG_OBJECT (self, "Allocated new bitstream buffer with size %"
-        G_GSIZE_FORMAT, size);
-
-    priv->bitstream = bitstream;
-    priv->bitstream_size = alloc_size;
-  }
-
-  hr = priv->bitstream->Map (0, nullptr, &map_data);
-  if (!gst_d3d12_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Couldn't map bitstream buffer");
-    return FALSE;
-  }
-
-  memcpy (map_data, data, size);
-  priv->bitstream->Unmap (0, nullptr);
-
-  return TRUE;
-}
-
 GstFlowReturn
 gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
     GstCodecPicture * picture, GPtrArray * ref_pics,
     const GstDxvaDecodingArgs * args)
 {
-  GstD3D12DecoderPrivate *priv = decoder->priv;
+  auto priv = decoder->priv;
   HRESULT hr;
   D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS out_args;
   D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS in_args;
@@ -825,14 +1026,15 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
   ID3D12Resource *out_resource = nullptr;
   GstD3D12Memory *dmem;
   UINT subresource[2];
-  GstD3D12DecoderPicture *decoder_pic = (GstD3D12DecoderPicture *)
-      gst_codec_picture_get_user_data (picture);
-  UINT64 fence_value;
-  ID3D12Fence *fence_handle;
-  std::vector < D3D12_RESOURCE_BARRIER > pre_barriers;
-  std::vector < D3D12_RESOURCE_BARRIER > post_barriers;
-  std::vector < GstD3D12DecoderPicture * >configured_ref_pics;
+  auto & pre_barriers = priv->pre_barriers;
+  auto & post_barriers = priv->post_barriers;
+  auto & configured_ref_pics = priv->configured_ref_pics;
 
+  pre_barriers.clear ();
+  post_barriers.clear ();
+  configured_ref_pics.clear ();
+
+  auto decoder_pic = get_decoder_picture (picture);
   if (!decoder_pic) {
     GST_ERROR_OBJECT (decoder, "No attached decoder picture");
     return GST_FLOW_ERROR;
@@ -846,34 +1048,49 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
   GST_LOG_OBJECT (decoder, "End picture with dxva-id %d, num-ref-pics %u",
       decoder_pic->view_id, ref_pics->len);
 
-  /* Wait for previous fence if needed */
-  gst_d3d12_fence_wait (priv->fence);
+  if (!priv->output_thread) {
+    GST_DEBUG_OBJECT (decoder, "Spawning output thread");
+    priv->output_thread = g_thread_new ("GstD3D12DecoderLoop",
+        (GThreadFunc) gst_d3d12_decoder_output_loop, decoder);
+  }
 
-  if (!gst_d3d12_decoder_upload_bitstream (decoder, args->bitstream,
-          args->bitstream_size)) {
+  GstD3D12DecoderCpb *cpb;
+  hr = gst_d3d12_decoder_cpb_pool_acquire (priv->session->cpb_pool,
+      args->bitstream, args->bitstream_size, &cpb);
+  if (!gst_d3d12_result (hr, decoder->device)) {
+    GST_ERROR_OBJECT (decoder, "Couldn't upload bitstream");
     return GST_FLOW_ERROR;
   }
 
   memset (&in_args, 0, sizeof (D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS));
   memset (&out_args, 0, sizeof (D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS));
 
-  hr = priv->ca->Reset ();
+  GstD3D12DeviceDecoderLockGuard dlk (decoder->device);
+  auto ca = gst_d3d12_decoder_cpb_get_command_allocator (cpb);
+  hr = ca->Reset ();
   if (!gst_d3d12_result (hr, decoder->device)) {
     GST_ERROR_OBJECT (decoder, "Couldn't reset command allocator");
+    gst_d3d12_decoder_cpb_unref (cpb);
     return GST_FLOW_ERROR;
   }
 
-  hr = priv->cl->Reset (priv->ca.Get ());
+  if (!priv->cmd->cl) {
+    hr = priv->cmd->device->CreateCommandList (0,
+        D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+        ca, nullptr, IID_PPV_ARGS (&priv->cmd->cl));
+  } else {
+    hr = priv->cmd->cl->Reset (ca);
+  }
+
   if (!gst_d3d12_result (hr, decoder->device)) {
-    GST_ERROR_OBJECT (decoder, "Couldn't reset command list");
+    GST_ERROR_OBJECT (decoder, "Couldn't configure command list");
+    gst_d3d12_decoder_cpb_unref (cpb);
     return GST_FLOW_ERROR;
   }
 
   for (guint i = 0; i < ref_pics->len; i++) {
-    GstCodecPicture *ref_pic =
-        (GstCodecPicture *) g_ptr_array_index (ref_pics, i);
-    GstD3D12DecoderPicture *ref_dec_pic =
-        (GstD3D12DecoderPicture *) gst_codec_picture_get_user_data (ref_pic);
+    auto ref_pic = (GstCodecPicture *) g_ptr_array_index (ref_pics, i);
+    auto ref_dec_pic = get_decoder_picture (ref_pic);
 
     if (!ref_dec_pic || ref_dec_pic == decoder_pic)
       continue;
@@ -888,22 +1105,30 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
     dmem = (GstD3D12Memory *) gst_buffer_peek_memory (ref_dec_pic->buffer, 0);
 
     resource = gst_d3d12_memory_get_resource_handle (dmem);
-    gst_d3d12_memory_get_subresource_index (dmem, 0, &subresource[0]);
-    gst_d3d12_memory_get_subresource_index (dmem, 1, &subresource[1]);
+    if (priv->session->array_of_textures) {
+      pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_COMMON,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ));
+      post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+              D3D12_RESOURCE_STATE_COMMON));
+    } else {
+      gst_d3d12_memory_get_subresource_index (dmem, 0, &subresource[0]);
+      gst_d3d12_memory_get_subresource_index (dmem, 1, &subresource[1]);
 
-    pre_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
-            subresource[0]));
-    pre_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
-            subresource[1]));
-
-    post_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-            D3D12_RESOURCE_STATE_VIDEO_DECODE_READ, D3D12_RESOURCE_STATE_COMMON,
-            subresource[0]));
-    post_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-            D3D12_RESOURCE_STATE_VIDEO_DECODE_READ, D3D12_RESOURCE_STATE_COMMON,
-            subresource[1]));
+      pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_COMMON,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ, subresource[0]));
+      pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_COMMON,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ, subresource[1]));
+      post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+              D3D12_RESOURCE_STATE_COMMON, subresource[0]));
+      post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+              D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+              D3D12_RESOURCE_STATE_COMMON, subresource[1]));
+    }
   }
 
   if (decoder_pic->output_buffer) {
@@ -911,10 +1136,10 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
         gst_buffer_peek_memory (decoder_pic->output_buffer, 0);
     out_resource = gst_d3d12_memory_get_resource_handle (dmem);
 
-    pre_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (out_resource,
+    pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (out_resource,
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE));
-    post_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (out_resource,
+    post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (out_resource,
             D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
             D3D12_RESOURCE_STATE_COMMON));
   }
@@ -923,24 +1148,33 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
   resource = gst_d3d12_memory_get_resource_handle (dmem);
   gst_d3d12_memory_get_subresource_index (GST_D3D12_MEMORY_CAST (dmem), 0,
       &subresource[0]);
-  gst_d3d12_memory_get_subresource_index (GST_D3D12_MEMORY_CAST (dmem), 1,
-      &subresource[1]);
 
-  pre_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
-          subresource[0]));
-  pre_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
-          subresource[1]));
+  if (priv->session->array_of_textures) {
+    pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE));
+    post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+            D3D12_RESOURCE_STATE_COMMON));
+  } else {
+    gst_d3d12_memory_get_subresource_index (GST_D3D12_MEMORY_CAST (dmem), 1,
+        &subresource[1]);
 
-  post_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-          D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, D3D12_RESOURCE_STATE_COMMON,
-          subresource[0]));
-  post_barriers.push_back (CD3D12_RESOURCE_BARRIER::Transition (resource,
-          D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, D3D12_RESOURCE_STATE_COMMON,
-          subresource[1]));
+    pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, subresource[0]));
+    pre_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, subresource[1]));
+    post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+            D3D12_RESOURCE_STATE_COMMON, subresource[0]));
+    post_barriers.push_back (CD3DX12_RESOURCE_BARRIER::Transition (resource,
+            D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+            D3D12_RESOURCE_STATE_COMMON, subresource[1]));
+  }
 
-  priv->cl->ResourceBarrier (pre_barriers.size (), &pre_barriers[0]);
+  priv->cmd->cl->ResourceBarrier (pre_barriers.size (), &pre_barriers[0]);
 
   if (out_resource) {
     out_args.pOutputTexture2D = out_resource;
@@ -984,38 +1218,53 @@ gst_d3d12_decoder_end_picture (GstD3D12Decoder * decoder,
     in_args.NumFrameArguments++;
   }
 
-  in_args.CompressedBitstream.pBuffer = priv->bitstream.Get ();
-  in_args.CompressedBitstream.Offset = 0;
+  gst_d3d12_decoder_cpb_get_bitstream (cpb, &in_args.CompressedBitstream);
   in_args.CompressedBitstream.Size = args->bitstream_size;
   in_args.pHeap = decoder_pic->heap.Get ();
 
-  in_args.ReferenceFrames.NumTexture2Ds = priv->dpb->GetSize ();
-  in_args.ReferenceFrames.ppHeaps = priv->dpb->GetHeaps ();
-  in_args.ReferenceFrames.ppTexture2Ds = priv->dpb->GetTextures ();
-  in_args.ReferenceFrames.pSubresources = priv->dpb->GetSubresources ();
+  priv->session->dpb->Lock ();
+  priv->session->dpb->GetReferenceFrames (in_args.ReferenceFrames);
 
-  priv->cl->DecodeFrame (priv->decoder.Get (), &out_args, &in_args);
-  priv->cl->ResourceBarrier (post_barriers.size (), &post_barriers[0]);
+  priv->cmd->cl->DecodeFrame (priv->session->decoder.Get (),
+      &out_args, &in_args);
 
-  hr = priv->cl->Close ();
+  if (!post_barriers.empty ())
+    priv->cmd->cl->ResourceBarrier (post_barriers.size (), &post_barriers[0]);
+
+  hr = priv->cmd->cl->Close ();
+  priv->session->dpb->Unlock ();
+
   if (!gst_d3d12_result (hr, decoder->device)) {
     GST_ERROR_OBJECT (decoder, "Couldn't record decoding command");
+    gst_d3d12_decoder_cpb_unref (cpb);
     return GST_FLOW_ERROR;
   }
 
-  ID3D12CommandList *cl[] = { priv->cl.Get () };
-  priv->cq->ExecuteCommandLists (1, cl);
+  ID3D12CommandList *cl[] = { priv->cmd->cl.Get () };
 
-  fence_handle = gst_d3d12_fence_get_handle (priv->fence);
-  fence_value = gst_d3d12_device_get_fence_value (decoder->device);
-  hr = priv->cq->Signal (fence_handle, fence_value);
+  hr = gst_d3d12_cmd_queue_execute_command_lists (priv->cmd->queue,
+      1, cl, &priv->cmd->fence_val);
   if (!gst_d3d12_result (hr, decoder->device)) {
-    GST_DEBUG_OBJECT (decoder, "Couldn't signal fence value");
+    GST_ERROR_OBJECT (decoder, "Couldn't execute command list");
+    gst_d3d12_decoder_cpb_unref (cpb);
     return GST_FLOW_ERROR;
   }
 
-  gst_d3d12_fence_set_event_on_completion_value (priv->fence, fence_value);
-  /* Will wait on output picture or start of next decoding loop */
+  decoder_pic->fence_val = priv->cmd->fence_val;
+
+  GstD3D12FenceData *fence_data;
+  gst_d3d12_fence_data_pool_acquire (priv->fence_data_pool, &fence_data);
+  gst_d3d12_fence_data_push (fence_data,
+      FENCE_NOTIFY_MINI_OBJECT (gst_mini_object_ref (decoder_pic)));
+  for (guint i = 0; i < ref_pics->len; i++) {
+    auto ref_pic = (GstCodecPicture *) g_ptr_array_index (ref_pics, i);
+    gst_d3d12_fence_data_push (fence_data,
+        FENCE_NOTIFY_MINI_OBJECT (gst_codec_picture_ref (ref_pic)));
+  }
+  gst_d3d12_fence_data_push (fence_data, FENCE_NOTIFY_MINI_OBJECT (cpb));
+
+  gst_d3d12_cmd_queue_set_notify (priv->cmd->queue, priv->cmd->fence_val,
+      fence_data, (GDestroyNotify) gst_d3d12_fence_data_unref);
 
   return GST_FLOW_OK;
 }
@@ -1025,30 +1274,33 @@ gst_d3d12_decoder_ensure_staging_texture (GstD3D12Decoder * self)
 {
   GstD3D12DecoderPrivate *priv = self->priv;
 
-  if (priv->staging)
+  if (priv->session->staging)
     return TRUE;
 
   ComPtr < ID3D12Resource > staging;
   HRESULT hr;
   UINT64 size;
-  ID3D12Device *device = gst_d3d12_device_get_device_handle (self->device);
+  auto device = gst_d3d12_device_get_device_handle (self->device);
   D3D12_RESOURCE_DESC tex_desc =
-      CD3D12_RESOURCE_DESC::Tex2D (priv->decoder_format,
-      priv->aligned_width, priv->aligned_height);
+      CD3DX12_RESOURCE_DESC::Tex2D (priv->session->decoder_format,
+      priv->session->aligned_width, priv->session->aligned_height, 1, 1);
 
-  device->GetCopyableFootprints (&tex_desc, 0, 2, 0, priv->layout, nullptr,
-      nullptr, &size);
+  device->GetCopyableFootprints (&tex_desc, 0, 2, 0,
+      priv->session->layout, nullptr, nullptr, &size);
 
-  D3D12_HEAP_PROPERTIES heap_prop = CD3D12_HEAP_PROPERTIES
+  D3D12_HEAP_PROPERTIES heap_prop = CD3DX12_HEAP_PROPERTIES
       (D3D12_HEAP_TYPE_READBACK);
-  D3D12_RESOURCE_DESC desc = CD3D12_RESOURCE_DESC::Buffer (size);
+  D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer (size);
+  D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
+  if (gst_d3d12_device_non_zeroed_supported (self->device))
+    heap_flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
 
-  hr = device->CreateCommittedResource (&heap_prop, D3D12_HEAP_FLAG_NONE,
+  hr = device->CreateCommittedResource (&heap_prop, heap_flags,
       &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS (&staging));
   if (!gst_d3d12_result (hr, self->device))
     return FALSE;
 
-  priv->staging = staging;
+  priv->session->staging = staging;
 
   return TRUE;
 }
@@ -1058,47 +1310,413 @@ gst_d3d12_decoder_can_direct_render (GstD3D12Decoder * self,
     GstVideoDecoder * videodec, GstBuffer * buffer,
     gint display_width, gint display_height)
 {
-  GstD3D12DecoderPrivate *priv = self->priv;
+  auto priv = self->priv;
 
-  /* We don't support direct render for reverse playback */
-  if (videodec->input_segment.rate < 0)
+  if (priv->session->output_type != GST_D3D12_DECODER_OUTPUT_D3D12)
     return FALSE;
 
-  if (priv->output_type != GST_D3D12_DECODER_OUTPUT_D3D12)
-    return FALSE;
-
-  if (display_width != GST_VIDEO_INFO_WIDTH (&priv->info) ||
-      display_height != GST_VIDEO_INFO_HEIGHT (&priv->info)) {
+  if (display_width != GST_VIDEO_INFO_WIDTH (&priv->session->info) ||
+      display_height != GST_VIDEO_INFO_HEIGHT (&priv->session->info)) {
     return FALSE;
   }
 
   /* We need to crop but downstream does not support crop, need to copy */
-  if (priv->need_crop && !priv->use_crop_meta)
+  if (priv->session->need_crop && !priv->session->use_crop_meta)
     return FALSE;
-
-  /* we can do direct render in this case, since there is no DPB pool size
-   * limit, or output picture does not use texture array */
-  if (priv->use_array_of_texture || priv->reference_only)
-    return TRUE;
-
-  /* Let's believe downstream info */
-  if (priv->wait_on_pool_full)
-    return TRUE;
-
-  GstMemory *mem = gst_buffer_peek_memory (buffer, 0);
-  GstD3D12PoolAllocator *alloc = (GstD3D12PoolAllocator *) mem->allocator;
-  guint max_size = 0;
-  guint outstanding_size = 0;
-
-  gst_d3d12_pool_allocator_get_pool_size (alloc, &max_size, &outstanding_size);
-
-  if (max_size <= outstanding_size + 1) {
-    GST_DEBUG_OBJECT (self, "memory pool is about to full (%u/%u)",
-        outstanding_size, max_size);
-    return FALSE;
-  }
 
   return TRUE;
+}
+
+static GstFlowReturn
+gst_d3d12_decoder_copy_output_12 (GstD3D12Decoder * self, GstBuffer * srcbuf,
+    ID3D12Resource * src, D3D12_TEXTURE_COPY_LOCATION dst[2],
+    D3D12_COMMAND_LIST_TYPE cmd_type, guint64 * fence_val)
+{
+  auto priv = self->priv;
+  D3D12_BOX src_box[2];
+  std::vector < GstD3D12CopyTextureRegionArgs > copy_args;
+
+  for (guint i = 0; i < 2; i++) {
+    GstD3D12CopyTextureRegionArgs args;
+    memset (&args, 0, sizeof (args));
+
+    args.src = CD3DX12_TEXTURE_COPY_LOCATION (src, i);
+    args.dst = dst[i];
+
+    /* FIXME: only 4:2:0 */
+    if (i == 0) {
+      src_box[i].left = GST_ROUND_UP_2 (priv->session->crop_x);
+      src_box[i].top = GST_ROUND_UP_2 (priv->session->crop_y);
+      src_box[i].right = GST_ROUND_UP_2 (priv->session->crop_x +
+          priv->session->output_info.width);
+      src_box[i].bottom =
+          GST_ROUND_UP_2 (priv->session->crop_y +
+          priv->session->output_info.height);
+    } else {
+      src_box[i].left = GST_ROUND_UP_2 (priv->session->crop_x) / 2;
+      src_box[i].top = GST_ROUND_UP_2 (priv->session->crop_y) / 2;
+      src_box[i].right =
+          GST_ROUND_UP_2 (priv->session->crop_x +
+          priv->session->output_info.width) / 2;
+      src_box[i].bottom =
+          GST_ROUND_UP_2 (priv->session->crop_y +
+          priv->session->output_info.height) / 2;
+    }
+
+    src_box[i].front = 0;
+    src_box[i].back = 1;
+
+    args.src_box = &src_box[i];
+    copy_args.push_back (args);
+  }
+
+  GstD3D12FenceData *fence_data = nullptr;
+  if (cmd_type != D3D12_COMMAND_LIST_TYPE_COPY) {
+    gst_d3d12_fence_data_pool_acquire (priv->fence_data_pool, &fence_data);
+    gst_d3d12_fence_data_push (fence_data,
+        FENCE_NOTIFY_MINI_OBJECT (gst_buffer_ref (srcbuf)));
+  }
+
+  guint64 copy_fence_val = 0;
+  auto copy_ret = gst_d3d12_device_copy_texture_region (self->device,
+      copy_args.size (), copy_args.data (), fence_data, 0, nullptr, nullptr,
+      cmd_type, &copy_fence_val);
+  if (!copy_ret) {
+    GST_ERROR_OBJECT (self, "Couldn't copy decoded texture to output");
+    gst_clear_d3d12_fence_data (&fence_data);
+    return GST_FLOW_ERROR;
+  }
+
+  if (fence_val)
+    *fence_val = copy_fence_val;
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn
+gst_d3d12_decoder_copy_output (GstD3D12Decoder * self, GstBuffer * src_buf,
+    GstBuffer * dst_buf)
+{
+  auto priv = self->priv;
+  auto session = priv->session.get ();
+
+  auto in_dmem = (GstD3D12Memory *) gst_buffer_peek_memory (src_buf, 0);
+  auto out_mem = gst_buffer_peek_memory (dst_buf, 0);
+  if (gst_is_d3d12_memory (out_mem)) {
+    auto out_dmem = GST_D3D12_MEMORY_CAST (out_mem);
+    if (gst_d3d12_device_is_equal (out_dmem->device, self->device)) {
+      D3D12_TEXTURE_COPY_LOCATION dst_location[2];
+      UINT out_subresource[2];
+      guint64 copy_fence_val;
+
+      auto in_resource = gst_d3d12_memory_get_resource_handle (in_dmem);
+      auto out_resource = gst_d3d12_memory_get_resource_handle (out_dmem);
+      gst_d3d12_memory_get_subresource_index (out_dmem, 0, &out_subresource[0]);
+      gst_d3d12_memory_get_subresource_index (out_dmem, 1, &out_subresource[1]);
+
+      dst_location[0] = CD3DX12_TEXTURE_COPY_LOCATION (out_resource,
+          out_subresource[0]);
+      dst_location[1] = CD3DX12_TEXTURE_COPY_LOCATION (out_resource,
+          out_subresource[1]);
+
+      auto ret = gst_d3d12_decoder_copy_output_12 (self, src_buf, in_resource,
+          dst_location, D3D12_COMMAND_LIST_TYPE_DIRECT, &copy_fence_val);
+      if (ret != GST_FLOW_OK)
+        return ret;
+
+      auto fence = gst_d3d12_device_get_fence_handle (self->device,
+          D3D12_COMMAND_LIST_TYPE_DIRECT);
+      gst_d3d12_memory_set_fence (out_dmem, fence, copy_fence_val, FALSE);
+
+      GST_MINI_OBJECT_FLAG_SET (out_dmem,
+          GST_D3D12_MEMORY_TRANSFER_NEED_DOWNLOAD);
+      GST_MINI_OBJECT_FLAG_UNSET (out_dmem,
+          GST_D3D12_MEMORY_TRANSFER_NEED_UPLOAD);
+
+      GST_TRACE_OBJECT (self, "d3d12 copy done");
+
+      return GST_FLOW_OK;
+    }
+  }
+#ifdef HAVE_GST_D3D11
+  else if (session->output_type == GST_D3D12_DECODER_OUTPUT_D3D11 &&
+      self->d3d11_interop && gst_is_d3d11_memory (out_mem)) {
+    auto out_dmem = GST_D3D11_MEMORY_CAST (out_mem);
+    if (out_dmem->device == self->device11) {
+      GstMapInfo out_map;
+      auto device11 = gst_d3d11_device_get_device_handle (self->device11);
+      auto in_texture11 =
+          gst_d3d12_memory_get_d3d11_texture (in_dmem, device11);
+
+      if (!in_texture11) {
+        GST_ERROR_OBJECT (self,
+            "Couldn't get d3d11 texture from decoded texture");
+        return GST_FLOW_ERROR;
+      }
+
+      if (!gst_memory_map (out_mem, &out_map,
+              (GstMapFlags) (GST_MAP_WRITE | GST_MAP_D3D11))) {
+        GST_ERROR_OBJECT (self, "Couldn't map output d3d11 memory");
+        return GST_FLOW_ERROR;
+      }
+
+      HRESULT hr;
+      {
+        GstD3D11DeviceLockGuard device11_lk (self->device11);
+        D3D11_BOX src_box = { };
+        src_box.left = GST_ROUND_UP_2 (session->crop_x);
+        src_box.top = GST_ROUND_UP_2 (session->crop_y);
+        src_box.right = GST_ROUND_UP_2 (session->crop_x +
+            session->output_info.width);
+        src_box.bottom = GST_ROUND_UP_2 (session->crop_y +
+            session->output_info.height);
+        src_box.front = 0;
+        src_box.back = 1;
+
+        auto out_texture11 = gst_d3d11_memory_get_resource_handle (out_dmem);
+        auto out_subresource =
+            gst_d3d11_memory_get_subresource_index (out_dmem);
+
+        priv->cmd->context11_4->CopySubresourceRegion (out_texture11,
+            out_subresource, 0, 0, 0, in_texture11, 0, &src_box);
+        priv->cmd->fence_val_11++;
+        hr = priv->cmd->context11_4->Signal (priv->cmd->fence11.Get (),
+            priv->cmd->fence_val_11);
+      }
+
+      gst_memory_unmap (out_mem, &out_map);
+
+      if (!gst_d3d11_result (hr, self->device11)) {
+        GST_ERROR_OBJECT (self, "Signal failed");
+        return GST_FLOW_ERROR;
+      }
+
+      /* Set d3d11 device signalled fence to d3d12 memory.
+       * d3d12 buffer pool or allocator will wait for this fence
+       * to keep resource alive if it's still being used by d3d11 */
+      gst_d3d12_memory_set_fence (in_dmem, priv->cmd->fence12.Get (),
+          priv->cmd->fence_val_11, FALSE);
+
+      GST_TRACE_OBJECT (self, "Copy done via d3d11 interop");
+
+      return GST_FLOW_OK;
+    }
+  }
+#endif
+
+  if (!gst_d3d12_decoder_ensure_staging_texture (self)) {
+    GST_ERROR_OBJECT (self, "Couldn't allocate staging texture");
+    return GST_FLOW_ERROR;
+  }
+
+  auto in_resource = gst_d3d12_memory_get_resource_handle (in_dmem);
+  D3D12_TEXTURE_COPY_LOCATION dst_location[2];
+
+  dst_location[0] = CD3DX12_TEXTURE_COPY_LOCATION (session->staging.Get (),
+      session->layout[0]);
+  dst_location[1] = CD3DX12_TEXTURE_COPY_LOCATION (session->staging.Get (),
+      session->layout[1]);
+
+  guint64 copy_fence_val;
+  auto ret = gst_d3d12_decoder_copy_output_12 (self, src_buf, in_resource,
+      dst_location, D3D12_COMMAND_LIST_TYPE_COPY, &copy_fence_val);
+  if (ret != GST_FLOW_OK) {
+    GST_ERROR_OBJECT (self, "Couldn't download to staging buffer");
+    return ret;
+  }
+
+  auto hr = gst_d3d12_device_fence_wait (self->device,
+      D3D12_COMMAND_LIST_TYPE_COPY, copy_fence_val);
+  if (!gst_d3d12_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Couldn't wait for fence");
+    return GST_FLOW_ERROR;
+  }
+
+  guint8 *map_data;
+  GstVideoFrame vframe;
+  hr = session->staging->Map (0, nullptr, (void **) &map_data);
+  if (!gst_d3d12_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Couldn't map staging texture");
+    return GST_FLOW_ERROR;
+  }
+
+  if (!gst_video_frame_map (&vframe,
+          &session->output_info, dst_buf, GST_MAP_WRITE)) {
+    GST_ERROR_OBJECT (self, "Couldn't map output buffer");
+    session->staging->Unmap (0, nullptr);
+    return GST_FLOW_ERROR;
+  }
+
+  for (guint i = 0; i < GST_VIDEO_FRAME_N_PLANES (&vframe); i++) {
+    guint8 *src_data = map_data + session->layout[i].Offset;
+    guint8 *dst_data = (guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&vframe, i);
+    gint width = GST_VIDEO_FRAME_COMP_WIDTH (&vframe, i) *
+        GST_VIDEO_FRAME_COMP_PSTRIDE (&vframe, i);
+
+    for (gint j = 0; j < GST_VIDEO_FRAME_COMP_HEIGHT (&vframe, i); j++) {
+      memcpy (dst_data, src_data, width);
+      dst_data += GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, i);
+      src_data += session->layout[i].Footprint.RowPitch;
+    }
+  }
+
+  session->staging->Unmap (0, nullptr);
+  gst_video_frame_unmap (&vframe);
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn
+gst_d3d12_decoder_process_output (GstD3D12Decoder * self,
+    GstVideoDecoder * videodec, GstVideoCodecFrame * frame,
+    GstCodecPicture * picture, GstVideoBufferFlags buffer_flags,
+    gint display_width, gint display_height)
+{
+  GstFlowReturn ret = GST_FLOW_ERROR;
+  GstBuffer *buffer;
+  bool attach_crop_meta = false;
+
+  auto priv = self->priv;
+
+  auto decoder_pic = get_decoder_picture (picture);
+  g_assert (decoder_pic);
+
+  gboolean need_negotiate = FALSE;
+  if (display_width != GST_VIDEO_INFO_WIDTH (&priv->session->output_info) ||
+      display_height != GST_VIDEO_INFO_HEIGHT (&priv->session->output_info)) {
+    GST_INFO_OBJECT (videodec, "Frame size changed, do renegotiate");
+
+    gst_video_info_set_interlaced_format (&priv->session->output_info,
+        GST_VIDEO_INFO_FORMAT (&priv->session->info),
+        GST_VIDEO_INFO_INTERLACE_MODE (&priv->session->info),
+        display_width, display_height);
+
+    need_negotiate = TRUE;
+  } else if (picture->discont_state) {
+    g_clear_pointer (&priv->session->input_state, gst_video_codec_state_unref);
+    priv->session->input_state =
+        gst_video_codec_state_ref (picture->discont_state);
+    need_negotiate = TRUE;
+  } else if (gst_pad_check_reconfigure (GST_VIDEO_DECODER_SRC_PAD (videodec))) {
+    need_negotiate = TRUE;
+  }
+
+  if (need_negotiate && !gst_video_decoder_negotiate (videodec)) {
+    GST_ERROR_OBJECT (videodec, "Couldn't negotiate with downstream");
+    gst_codec_picture_unref (picture);
+    gst_video_decoder_release_frame (videodec, frame);
+    return GST_FLOW_NOT_NEGOTIATED;
+  }
+
+  buffer = decoder_pic->output_buffer ?
+      decoder_pic->output_buffer : decoder_pic->buffer;
+
+  priv->session->lock.lock ();
+  if (gst_d3d12_decoder_can_direct_render (self, videodec,
+          decoder_pic->buffer, display_width, display_height)) {
+    GST_LOG_OBJECT (self, "Outputting without copy");
+
+    auto mem = gst_buffer_peek_memory (buffer, 0);
+    GST_MINI_OBJECT_FLAG_SET (mem, GST_D3D12_MEMORY_TRANSFER_NEED_DOWNLOAD);
+    GST_MINI_OBJECT_FLAG_UNSET (mem, GST_D3D12_MEMORY_TRANSFER_NEED_UPLOAD);
+
+    if (priv->session->need_crop)
+      attach_crop_meta = true;
+
+    frame->output_buffer = gst_buffer_ref (buffer);
+  } else {
+    ret = gst_video_decoder_allocate_output_frame (videodec, frame);
+    if (ret != GST_FLOW_OK) {
+      GST_ERROR_OBJECT (videodec, "Couldn't allocate output buffer");
+      goto error;
+    }
+
+    ret = gst_d3d12_decoder_copy_output (self, buffer, frame->output_buffer);
+    if (ret != GST_FLOW_OK)
+      goto error;
+  }
+
+  priv->session->lock.unlock ();
+
+  GST_BUFFER_FLAG_SET (frame->output_buffer, buffer_flags);
+  gst_codec_picture_unref (picture);
+
+  if (attach_crop_meta) {
+    frame->output_buffer = gst_buffer_make_writable (frame->output_buffer);
+
+    auto crop_meta = gst_buffer_add_video_crop_meta (frame->output_buffer);
+    crop_meta->x = priv->session->crop_x;
+    crop_meta->y = priv->session->crop_y;
+    crop_meta->width = priv->session->info.width;
+    crop_meta->height = priv->session->info.height;
+
+    GST_TRACE_OBJECT (self, "Attatching crop meta");
+  }
+
+  return gst_video_decoder_finish_frame (videodec, frame);
+
+error:
+  priv->session->lock.unlock ();
+  gst_codec_picture_unref (picture);
+  gst_video_decoder_release_frame (videodec, frame);
+
+  return ret;
+}
+
+static gpointer
+gst_d3d12_decoder_output_loop (GstD3D12Decoder * self)
+{
+  auto priv = self->priv;
+
+  GST_DEBUG_OBJECT (self, "Entering output thread");
+
+  while (true) {
+    DecoderOutputData output_data;
+    {
+      GST_LOG_OBJECT (self, "Waiting for output data");
+      std::unique_lock < std::mutex > lk (priv->session->queue_lock);
+      while (gst_vec_deque_is_empty (priv->session->output_queue))
+        priv->session->queue_cond.wait (lk);
+
+      output_data = *((DecoderOutputData *)
+          gst_vec_deque_pop_head_struct (priv->session->output_queue));
+    }
+
+    if (!output_data.frame) {
+      GST_DEBUG_OBJECT (self, "Got terminate data");
+      break;
+    }
+
+    auto decoder_pic = get_decoder_picture (output_data.picture);
+    g_assert (decoder_pic);
+
+    gst_d3d12_cmd_queue_fence_wait (priv->cmd->queue, decoder_pic->fence_val);
+
+    if (priv->flushing) {
+      GST_DEBUG_OBJECT (self, "Drop framem, we are flushing");
+      gst_codec_picture_unref (output_data.picture);
+      gst_video_decoder_release_frame (output_data.decoder, output_data.frame);
+    } else if (priv->last_flow == GST_FLOW_OK) {
+      priv->last_flow = gst_d3d12_decoder_process_output (self,
+          output_data.decoder, output_data.frame, output_data.picture,
+          output_data.buffer_flags, output_data.width, output_data.height);
+
+      if (priv->last_flow != GST_FLOW_FLUSHING &&
+          priv->last_flow != GST_FLOW_OK) {
+        GST_WARNING_OBJECT (self, "Last flow was %s",
+            gst_flow_get_name (priv->last_flow));
+      }
+    } else {
+      GST_DEBUG_OBJECT (self, "Dropping framem last flow return was %s",
+          gst_flow_get_name (priv->last_flow));
+      gst_codec_picture_unref (output_data.picture);
+      gst_video_decoder_release_frame (output_data.decoder, output_data.frame);
+    }
+  }
+
+  GST_DEBUG_OBJECT (self, "Leaving output thread");
+
+  return nullptr;
 }
 
 GstFlowReturn
@@ -1107,412 +1725,35 @@ gst_d3d12_decoder_output_picture (GstD3D12Decoder * decoder,
     GstCodecPicture * picture, GstVideoBufferFlags buffer_flags,
     gint display_width, gint display_height)
 {
-  GstD3D12DecoderPrivate *priv = decoder->priv;
-  GstD3D12DecoderPicture *decoder_pic;
-  GstFlowReturn ret = GST_FLOW_ERROR;
-  ID3D12CommandList *list[1];
-  UINT64 fence_value;
-  GstBuffer *buffer;
-  GstD3D12Memory *dmem;
-  ID3D12Resource *resource;
-  UINT subresource[2];
-  void *map_data;
-  HRESULT hr;
-  GstVideoFrame vframe;
-  ID3D12CommandQueue *copy_queue;
-
   g_return_val_if_fail (GST_IS_D3D12_DECODER (decoder), GST_FLOW_ERROR);
   g_return_val_if_fail (GST_IS_VIDEO_DECODER (videodec), GST_FLOW_ERROR);
+  g_return_val_if_fail (frame != nullptr, GST_FLOW_ERROR);
   g_return_val_if_fail (picture != nullptr, GST_FLOW_ERROR);
 
-  priv = decoder->priv;
+  auto priv = decoder->priv;
 
-  copy_queue = gst_d3d12_device_get_copy_queue (decoder->device);
-  if (!copy_queue) {
-    ret = GST_FLOW_ERROR;
-    goto error;
+  GST_LOG_OBJECT (decoder, "Output picture");
+
+  if (!priv->session) {
+    GST_ERROR_OBJECT (decoder, "No session configured");
+    gst_codec_picture_unref (picture);
+    gst_video_decoder_release_frame (videodec, frame);
+    return GST_FLOW_ERROR;
   }
 
-  decoder_pic = (GstD3D12DecoderPicture *)
-      gst_codec_picture_get_user_data (picture);
-  if (!decoder_pic) {
-    ret = GST_FLOW_ERROR;
-    goto error;
-  }
-
-  if (display_width != GST_VIDEO_INFO_WIDTH (&priv->output_info) ||
-      display_height != GST_VIDEO_INFO_HEIGHT (&priv->output_info)) {
-    GST_INFO_OBJECT (videodec, "Frame size changed, do renegotiate");
-
-    gst_video_info_set_format (&priv->output_info,
-        GST_VIDEO_INFO_FORMAT (&priv->info), display_width, display_height);
-    GST_VIDEO_INFO_INTERLACE_MODE (&priv->output_info) =
-        GST_VIDEO_INFO_INTERLACE_MODE (&priv->info);
-
-    if (!gst_video_decoder_negotiate (videodec)) {
-      GST_ERROR_OBJECT (videodec, "Failed to re-negotiate with new frame size");
-      ret = GST_FLOW_NOT_NEGOTIATED;
-      goto error;
-    }
-  } else if (picture->discont_state) {
-    if (!gst_video_decoder_negotiate (videodec)) {
-      GST_ERROR_OBJECT (videodec, "Could not re-negotiate with updated state");
-      ret = GST_FLOW_NOT_NEGOTIATED;
-      goto error;
-    }
-  }
-
-  /* Wait for pending decoding operation before copying */
-  gst_d3d12_fence_wait (priv->fence);
-  buffer = decoder_pic->output_buffer ?
-      decoder_pic->output_buffer : decoder_pic->buffer;
-  dmem = (GstD3D12Memory *) gst_buffer_peek_memory (buffer, 0);
-
-  if (gst_d3d12_decoder_can_direct_render (decoder, videodec,
-          decoder_pic->buffer, display_width, display_height)) {
-    GST_LOG_OBJECT (decoder, "Outputting without copy");
-
-    GST_MINI_OBJECT_FLAG_SET (dmem, GST_D3D12_MEMORY_TRANSFER_NEED_DOWNLOAD);
-    GST_MINI_OBJECT_FLAG_UNSET (dmem, GST_D3D12_MEMORY_TRANSFER_NEED_UPLOAD);
-
-    if (priv->need_crop) {
-      GstVideoCropMeta *crop_meta;
-
-      buffer = gst_buffer_make_writable (buffer);
-      crop_meta = gst_buffer_get_video_crop_meta (buffer);
-      if (!crop_meta)
-        crop_meta = gst_buffer_add_video_crop_meta (buffer);
-
-      crop_meta->x = priv->crop_x;
-      crop_meta->y = priv->crop_y;
-      crop_meta->width = priv->info.width;
-      crop_meta->height = priv->info.height;
-
-      GST_TRACE_OBJECT (decoder, "Attatching crop meta");
-    }
-
-    frame->output_buffer = gst_buffer_ref (buffer);
-  } else {
-    GstMemory *mem;
-    ID3D12Resource *out_resource = nullptr;
-    UINT out_subresource[2];
-    GstD3D12Fence *out_fence = priv->fence;
-    ComPtr < ID3D12Resource > shared_resource;
-
-    ret = gst_video_decoder_allocate_output_frame (videodec, frame);
-    if (ret != GST_FLOW_OK) {
-      GST_ERROR_OBJECT (videodec, "Couldn't allocate output buffer");
-      goto error;
-    }
-
-    mem = gst_buffer_peek_memory (frame->output_buffer, 0);
-    if (gst_is_d3d12_memory (mem)) {
-      dmem = GST_D3D12_MEMORY_CAST (mem);
-      if (dmem->device == decoder->device) {
-        out_resource = gst_d3d12_memory_get_resource_handle (dmem);
-        gst_d3d12_memory_get_subresource_index (dmem, 0, &out_subresource[0]);
-        gst_d3d12_memory_get_subresource_index (dmem, 1, &out_subresource[1]);
-        out_fence = dmem->fence;
-
-        GST_MINI_OBJECT_FLAG_SET (dmem,
-            GST_D3D12_MEMORY_TRANSFER_NEED_DOWNLOAD);
-        GST_MINI_OBJECT_FLAG_UNSET (dmem,
-            GST_D3D12_MEMORY_TRANSFER_NEED_UPLOAD);
-      }
-    } else if (gst_is_d3d11_memory (mem) &&
-        GST_D3D11_MEMORY_CAST (mem)->device == decoder->d3d11_device) {
-      HANDLE resource_handle;
-      if (gst_d3d11_memory_get_nt_handle (GST_D3D11_MEMORY_CAST (mem),
-              &resource_handle)) {
-        ID3D12Device *device_handle =
-            gst_d3d12_device_get_device_handle (decoder->device);
-        hr = device_handle->OpenSharedHandle (resource_handle,
-            IID_PPV_ARGS (&shared_resource));
-        if (gst_d3d12_result (hr, decoder->device)) {
-          out_resource = shared_resource.Get ();
-          out_subresource[0] = 0;
-          out_subresource[1] = 1;
-          GST_MINI_OBJECT_FLAG_SET (mem,
-              GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
-          GST_MINI_OBJECT_FLAG_UNSET (mem,
-              GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
-        }
-      }
-    }
-
-    if (!out_resource && !gst_d3d12_decoder_ensure_staging_texture (decoder)) {
-      GST_ERROR_OBJECT (videodec, "Couldn't allocate staging texture");
-      ret = GST_FLOW_ERROR;
-      goto error;
-    }
-
-    resource = gst_d3d12_memory_get_resource_handle (dmem);
-
-    gst_d3d12_memory_get_subresource_index (dmem, 0, &subresource[0]);
-    gst_d3d12_memory_get_subresource_index (dmem, 1, &subresource[1]);
-
-    /* Copy texture to staging */
-    hr = priv->copy_ca->Reset ();
-    if (!gst_d3d12_result (hr, decoder->device)) {
-      ret = GST_FLOW_ERROR;
-      goto error;
-    }
-
-    hr = priv->copy_cl->Reset (priv->copy_ca.Get (), nullptr);
-    if (!gst_d3d12_result (hr, decoder->device)) {
-      ret = GST_FLOW_ERROR;
-      goto error;
-    }
-
-    if (shared_resource)
-      gst_d3d11_device_lock (decoder->d3d11_device);
-
-    /* simultaneous access must be enabled already, so,barrier is not needed */
-    for (guint i = 0; i < 2; i++) {
-      D3D12_TEXTURE_COPY_LOCATION src =
-          CD3D12_TEXTURE_COPY_LOCATION (resource, subresource[i]);
-      D3D12_TEXTURE_COPY_LOCATION dst;
-      D3D12_BOX src_box = { 0, };
-
-      if (out_resource) {
-        dst = CD3D12_TEXTURE_COPY_LOCATION (out_resource, out_subresource[i]);
-      } else {
-        dst =
-            CD3D12_TEXTURE_COPY_LOCATION (priv->staging.Get (),
-            priv->layout[i]);
-      }
-
-      /* FIXME: only 4:2:0 */
-      if (i == 0) {
-        src_box.left = GST_ROUND_UP_2 (priv->crop_x);
-        src_box.top = GST_ROUND_UP_2 (priv->crop_y);
-        src_box.right = GST_ROUND_UP_2 (priv->crop_x + priv->output_info.width);
-        src_box.bottom =
-            GST_ROUND_UP_2 (priv->crop_y + priv->output_info.height);
-      } else {
-        src_box.left = GST_ROUND_UP_2 (priv->crop_x) / 2;
-        src_box.top = GST_ROUND_UP_2 (priv->crop_y) / 2;
-        src_box.right =
-            GST_ROUND_UP_2 (priv->crop_x + priv->output_info.width) / 2;
-        src_box.bottom =
-            GST_ROUND_UP_2 (priv->crop_y + priv->output_info.height) / 2;
-      }
-
-      src_box.front = 0;
-      src_box.back = 1;
-
-      priv->copy_cl->CopyTextureRegion (&dst, 0, 0, 0, &src, &src_box);
-    }
-
-    hr = priv->copy_cl->Close ();
-    if (!gst_d3d12_result (hr, decoder->device)) {
-      GST_ERROR_OBJECT (videodec, "Couldn't record copy command");
-      if (shared_resource)
-        gst_d3d11_device_unlock (decoder->d3d11_device);
-      ret = GST_FLOW_ERROR;
-      goto error;
-    }
-
-    list[0] = priv->copy_cl.Get ();
-    copy_queue->ExecuteCommandLists (1, list);
-
-    fence_value = gst_d3d12_device_get_fence_value (decoder->device);
-    hr = copy_queue->Signal (gst_d3d12_fence_get_handle (out_fence),
-        fence_value);
-    if (!gst_d3d12_result (hr, decoder->device)) {
-      if (shared_resource)
-        gst_d3d11_device_unlock (decoder->d3d11_device);
-      ret = GST_FLOW_ERROR;
-      goto error;
-    }
-
-    gst_d3d12_fence_set_event_on_completion_value (out_fence, fence_value);
-
-    if (!out_resource) {
-      gst_d3d12_fence_wait (out_fence);
-
-      hr = priv->staging->Map (0, nullptr, &map_data);
-      if (!gst_d3d12_result (hr, decoder->device)) {
-        ret = GST_FLOW_ERROR;
-        goto error;
-      }
-
-      gst_video_frame_map (&vframe,
-          &priv->output_info, frame->output_buffer, GST_MAP_WRITE);
-
-      for (guint i = 0; i < GST_VIDEO_FRAME_N_PLANES (&vframe); i++) {
-        guint8 *src = (guint8 *) map_data + priv->layout[i].Offset;
-        guint8 *dst = (guint8 *) GST_VIDEO_FRAME_PLANE_DATA (&vframe, i);
-        gint width = GST_VIDEO_FRAME_COMP_WIDTH (&vframe, i) *
-            GST_VIDEO_FRAME_COMP_PSTRIDE (&vframe, i);
-
-        for (guint j = 0; j < GST_VIDEO_FRAME_COMP_HEIGHT (&vframe, i); j++) {
-          memcpy (dst, src, width);
-          dst += GST_VIDEO_FRAME_PLANE_STRIDE (&vframe, i);
-          src += priv->layout[i].Footprint.RowPitch;
-        }
-      }
-
-      priv->staging->Unmap (0, nullptr);
-      gst_video_frame_unmap (&vframe);
-    } else if (shared_resource) {
-      gst_d3d12_fence_wait (out_fence);
-      gst_d3d11_device_unlock (decoder->d3d11_device);
-    }
-  }
-
-  gst_codec_picture_unref (picture);
-  return gst_video_decoder_finish_frame (videodec, frame);
-
-error:
-  gst_codec_picture_unref (picture);
-  gst_video_decoder_release_frame (videodec, frame);
-
-  return ret;
-}
-
-static gboolean
-gst_d3d12_decoder_create (GstD3D12Decoder * self)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-  HRESULT hr;
-  gint aligned_width, aligned_height;
-  ID3D12VideoDevice *video_device;
-  GstVideoInfo *info = &priv->info;
-  D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT support;
-  ComPtr < ID3D12VideoDecoderHeap > heap;
-
-  if (priv->opened)
-    return TRUE;
-
-  if (!priv->configured) {
-    GST_ERROR_OBJECT (self, "Should configure first");
-    return FALSE;
-  }
-
-  video_device = priv->video_device.Get ();
-
-  const DecoderFormat *decoder_foramt = nullptr;
-  for (guint i = 0; i < G_N_ELEMENTS (format_list); i++) {
-    decoder_foramt = nullptr;
-
-    if (format_list[i].codec != self->codec)
-      continue;
-
-    for (guint j = 0; j < G_N_ELEMENTS (format_list[i].format); j++) {
-      DXGI_FORMAT format = format_list[i].format[j];
-
-      if (format == DXGI_FORMAT_UNKNOWN)
-        break;
-
-      if (format == priv->decoder_format) {
-        decoder_foramt = &format_list[i];
-        break;
-      }
-    }
-
-    if (!decoder_foramt)
-      continue;
-
-    D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT s;
-    s.NodeIndex = 0;
-
-    s.Configuration.DecodeProfile = format_list[i].decode_profile;
-    s.Configuration.BitstreamEncryption = D3D12_BITSTREAM_ENCRYPTION_TYPE_NONE;
-    if (GST_VIDEO_INFO_IS_INTERLACED (info) &&
-        GST_VIDEO_INFO_INTERLACE_MODE (info) !=
-        GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
-      s.Configuration.InterlaceType =
-          D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_FIELD_BASED;
-    } else {
-      s.Configuration.InterlaceType =
-          D3D12_VIDEO_FRAME_CODED_INTERLACE_TYPE_NONE;
-    }
-    s.DecodeFormat = priv->decoder_format;
-    s.FrameRate = { 0, 1 };
-    s.BitRate = 0;
-    s.Width = priv->coded_width;
-    s.Height = priv->coded_height;
-
-    hr = video_device->CheckFeatureSupport (D3D12_FEATURE_VIDEO_DECODE_SUPPORT,
-        &s, sizeof (D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT));
-    if (FAILED (hr))
-      continue;
-
-    if ((s.SupportFlags & D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED) == 0) {
-      GST_INFO_OBJECT (self, "Device doesn't support current configuration");
-      continue;
-    }
-
-    support = s;
-
-    GST_INFO_OBJECT (self,
-        "Created decoder support tier %d with configuration flags 0x%x",
-        support.DecodeTier, support.ConfigurationFlags);
-    break;
-  }
-
-  if (!decoder_foramt) {
-    GST_WARNING_OBJECT (self, "Failed to find supported configuration");
-    return FALSE;
-  }
-
-  guint alignment = 16;
-  if ((support.ConfigurationFlags &
-          D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_HEIGHT_ALIGNMENT_MULTIPLE_32_REQUIRED)
-      != 0) {
-    alignment = 32;
-  }
-
-  aligned_width = GST_ROUND_UP_N (priv->coded_width, alignment);
-  aligned_height = GST_ROUND_UP_N (priv->coded_height, alignment);
-
-  priv->aligned_width = aligned_width;
-  priv->aligned_height = aligned_height;
-
-  /* We can reuse decoder object, which is resolution independent */
-  if (!priv->decoder ||
-      priv->support.Configuration.DecodeProfile !=
-      support.Configuration.DecodeProfile
-      || priv->support.Configuration.InterlaceType !=
-      support.Configuration.InterlaceType) {
-    ComPtr < ID3D12VideoDecoder > decoder;
-
-    priv->decoder = nullptr;
-
-    D3D12_VIDEO_DECODER_DESC desc;
-    desc.NodeMask = 0;
-    desc.Configuration = support.Configuration;
-    hr = video_device->CreateVideoDecoder (&desc, IID_PPV_ARGS (&decoder));
-    if (!gst_d3d12_result (hr, self->device)) {
-      GST_ERROR_OBJECT (self, "Failed to create decoder");
-      return FALSE;
-    }
-
-    priv->decoder = decoder;
-  }
-
-  D3D12_VIDEO_DECODER_HEAP_DESC heap_desc;
-  heap_desc.NodeMask = 0;
-  heap_desc.Configuration = support.Configuration;
-  heap_desc.DecodeWidth = priv->aligned_width;
-  heap_desc.DecodeHeight = priv->aligned_height;
-  heap_desc.Format = priv->decoder_format;
-  heap_desc.FrameRate = { 0, 1 };
-  heap_desc.BitRate = 0;
-  heap_desc.MaxDecodePictureBufferCount = priv->dpb_size;
-  hr = video_device->CreateVideoDecoderHeap (&heap_desc, IID_PPV_ARGS (&heap));
-  if (!gst_d3d12_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create decoder heap");
-    return FALSE;
-  }
-
-  priv->heap = heap;
-  priv->support = support;
-
-  priv->opened = TRUE;
-
-  return TRUE;
+  auto output_data = DecoderOutputData ();
+  output_data.decoder = videodec;
+  output_data.frame = frame;
+  output_data.picture = picture;
+  output_data.buffer_flags = buffer_flags;
+  output_data.width = display_width;
+  output_data.height = display_height;
+
+  std::lock_guard < std::mutex > lk (priv->session->queue_lock);
+  gst_vec_deque_push_tail_struct (priv->session->output_queue, &output_data);
+  priv->session->queue_cond.notify_one ();
+
+  return priv->last_flow;
 }
 
 gboolean
@@ -1522,19 +1763,20 @@ gst_d3d12_decoder_negotiate (GstD3D12Decoder * decoder,
   g_return_val_if_fail (GST_IS_D3D12_DECODER (decoder), FALSE);
   g_return_val_if_fail (GST_IS_VIDEO_DECODER (videodec), FALSE);
 
-  GstD3D12DecoderPrivate *priv = decoder->priv;
-  GstVideoInfo *info = &priv->output_info;
-  GstCaps *peer_caps;
-  GstVideoCodecState *state = nullptr;
-  GstVideoCodecState *input_state = priv->input_state;
+  auto priv = decoder->priv;
   GstStructure *s;
   const gchar *str;
-  gboolean d3d12_supported = FALSE;
-  gboolean d3d11_supported = FALSE;
 
-  peer_caps = gst_pad_get_allowed_caps (GST_VIDEO_DECODER_SRC_PAD (videodec));
+  if (!priv->session) {
+    GST_WARNING_OBJECT (decoder, "No configured session");
+    return FALSE;
+  }
+
+  auto peer_caps =
+      gst_pad_get_allowed_caps (GST_VIDEO_DECODER_SRC_PAD (videodec));
   GST_DEBUG_OBJECT (videodec, "Allowed caps %" GST_PTR_FORMAT, peer_caps);
 
+  GstD3D12DecoderOutputType allowed_types = GST_D3D12_DECODER_OUTPUT_UNKNOWN;
   if (!peer_caps || gst_caps_is_any (peer_caps)) {
     GST_DEBUG_OBJECT (videodec,
         "cannot determine output format, use system memory");
@@ -1551,20 +1793,27 @@ gst_d3d12_decoder_negotiate (GstD3D12Decoder * decoder,
 
       if (gst_caps_features_contains (features,
               GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY)) {
-        d3d12_supported = TRUE;
-      } else if (gst_caps_features_contains (features,
-              GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY)) {
-        d3d11_supported = TRUE;
+        allowed_types |= GST_D3D12_DECODER_OUTPUT_D3D12;
       }
+#ifdef HAVE_GST_D3D11
+      if (gst_caps_features_contains (features,
+              GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY)) {
+        allowed_types |= GST_D3D12_DECODER_OUTPUT_D3D11;
+      }
+#endif
     }
   }
   gst_clear_caps (&peer_caps);
 
-  GST_DEBUG_OBJECT (videodec, "Downstream feature support, D3D12 memory: %d",
-      d3d12_supported);
+  GST_DEBUG_OBJECT (videodec, "Downstream feature support 0x%x",
+      (guint) allowed_types);
+
+  std::lock_guard < std::recursive_mutex > lk (priv->session->lock);
+  auto input_state = priv->session->input_state;
+  auto info = &priv->session->output_info;
 
   /* TODO: add support alternate interlace */
-  state = gst_video_decoder_set_interlaced_output_state (videodec,
+  auto state = gst_video_decoder_set_interlaced_output_state (videodec,
       GST_VIDEO_INFO_FORMAT (info), GST_VIDEO_INFO_INTERLACE_MODE (info),
       GST_VIDEO_INFO_WIDTH (info), GST_VIDEO_INFO_HEIGHT (info), input_state);
 
@@ -1588,23 +1837,94 @@ gst_d3d12_decoder_negotiate (GstD3D12Decoder * decoder,
         "content-light-level", G_TYPE_STRING, str, nullptr);
   }
 
-  g_clear_pointer (&priv->output_state, gst_video_codec_state_unref);
-  priv->output_state = state;
+  g_clear_pointer (&priv->session->output_state, gst_video_codec_state_unref);
+  priv->session->output_state = state;
 
-  priv->output_type = GST_D3D12_DECODER_OUTPUT_SYSTEM;
-  if (d3d12_supported) {
-    gst_caps_set_features (state->caps, 0,
-        gst_caps_features_new_single (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY));
-    priv->output_type = GST_D3D12_DECODER_OUTPUT_D3D12;
-  } else if (d3d11_supported
-      && gst_d3d11_ensure_element_data_for_adapter_luid (GST_ELEMENT (videodec),
-          decoder->adapter_luid, &decoder->d3d11_device)) {
-    gst_caps_set_features (state->caps, 0,
-        gst_caps_features_new_single (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY));
-    priv->output_type = GST_D3D12_DECODER_OUTPUT_D3D11;
+#ifdef HAVE_GST_D3D11
+  /* Try d3d11 only if downstream does not support d3d12 but does d3d11,
+   * otherwise decoder will create unnecessary d3d11 device */
+  if ((allowed_types & GST_D3D12_DECODER_OUTPUT_D3D11) ==
+      GST_D3D12_DECODER_OUTPUT_D3D11 &&
+      (allowed_types & GST_D3D12_DECODER_OUTPUT_D3D12) !=
+      GST_D3D12_DECODER_OUTPUT_D3D12) {
+    auto elem = GST_ELEMENT (videodec);
+    if (decoder->d3d11_interop) {
+      if (gst_d3d11_ensure_element_data_for_adapter_luid (elem,
+              decoder->adapter_luid, &decoder->device11)) {
+        if (!priv->cmd->device11_5) {
+          auto device11 =
+              gst_d3d11_device_get_device_handle (decoder->device11);
+          device11->QueryInterface (IID_PPV_ARGS (&priv->cmd->device11_5));
+        }
+
+        if (priv->cmd->device11_5 && !priv->cmd->context11_4) {
+          ComPtr < ID3D11DeviceContext > context11;
+          ComPtr < ID3D11DeviceContext4 > context11_4;
+          priv->cmd->device11_5->GetImmediateContext (&context11);
+          context11.As (&priv->cmd->context11_4);
+        }
+
+        if (priv->cmd->context11_4 && !priv->cmd->fence11) {
+          priv->cmd->device11_5->CreateFence (0, D3D11_FENCE_FLAG_SHARED,
+              IID_PPV_ARGS (&priv->cmd->fence11));
+        }
+
+        if (priv->cmd->fence11 && !priv->cmd->fence12) {
+          HANDLE handle;
+          auto hr = priv->cmd->fence11->CreateSharedHandle (nullptr,
+              GENERIC_ALL, nullptr, &handle);
+          if (SUCCEEDED (hr)) {
+            priv->cmd->device->OpenSharedHandle (handle,
+                IID_PPV_ARGS (&priv->cmd->fence12));
+            CloseHandle (handle);
+          }
+        }
+
+        if (!priv->cmd->fence12)
+          allowed_types &= ~GST_D3D12_DECODER_OUTPUT_D3D11;
+      } else {
+        allowed_types &= ~GST_D3D12_DECODER_OUTPUT_D3D11;
+      }
+    } else if (!gst_d3d11_ensure_element_data (elem, -1, &decoder->device11)) {
+      allowed_types &= ~GST_D3D12_DECODER_OUTPUT_D3D11;
+    }
+  }
+#endif
+
+  auto prev_output_type = priv->session->output_type;
+  if (prev_output_type != GST_D3D12_DECODER_OUTPUT_UNKNOWN &&
+      (prev_output_type & allowed_types) == prev_output_type) {
+    priv->session->output_type = prev_output_type;
+  } else {
+    if ((allowed_types & GST_D3D12_DECODER_OUTPUT_D3D12) != 0)
+      priv->session->output_type = GST_D3D12_DECODER_OUTPUT_D3D12;
+    else if ((allowed_types & GST_D3D12_DECODER_OUTPUT_D3D11) != 0)
+      priv->session->output_type = GST_D3D12_DECODER_OUTPUT_D3D11;
+    else
+      priv->session->output_type = GST_D3D12_DECODER_OUTPUT_SYSTEM;
   }
 
-  return gst_d3d12_decoder_create (decoder);
+  switch (priv->session->output_type) {
+    case GST_D3D12_DECODER_OUTPUT_D3D12:
+      gst_caps_set_features (state->caps, 0,
+          gst_caps_features_new_single_static_str
+          (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY));
+      break;
+#ifdef HAVE_GST_D3D11
+    case GST_D3D12_DECODER_OUTPUT_D3D11:
+      gst_caps_set_features (state->caps, 0,
+          gst_caps_features_new_single_static_str
+          (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY));
+      break;
+#endif
+    default:
+      break;
+  }
+
+  GST_DEBUG_OBJECT (decoder, "Selected output type %d",
+      priv->session->output_type);
+
+  return TRUE;
 }
 
 gboolean
@@ -1615,14 +1935,14 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
   GstCaps *outcaps;
   GstBufferPool *pool = nullptr;
   guint n, size, min = 0, max = 0;
-  GstVideoInfo vinfo = { 0, };
+  GstVideoInfo vinfo;
   GstStructure *config;
 
   g_return_val_if_fail (GST_IS_D3D12_DECODER (decoder), FALSE);
   g_return_val_if_fail (GST_IS_VIDEO_DECODER (videodec), FALSE);
   g_return_val_if_fail (query != nullptr, FALSE);
 
-  if (!priv->opened) {
+  if (!priv->session) {
     GST_ERROR_OBJECT (videodec, "Should open decoder first");
     return FALSE;
   }
@@ -1634,12 +1954,13 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
     return FALSE;
   }
 
-  if (priv->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
-    priv->use_crop_meta =
+  std::lock_guard < std::recursive_mutex > lk (priv->session->lock);
+  if (priv->session->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
+    priv->session->use_crop_meta =
         gst_query_find_allocation_meta (query, GST_VIDEO_CROP_META_API_TYPE,
         nullptr);
   } else {
-    priv->use_crop_meta = FALSE;
+    priv->session->use_crop_meta = false;
   }
 
   gst_video_info_from_caps (&vinfo, outcaps);
@@ -1648,41 +1969,46 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
 
   if (pool) {
-    if (priv->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
+    if (priv->session->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
       if (!GST_IS_D3D12_BUFFER_POOL (pool)) {
         GST_DEBUG_OBJECT (videodec,
             "Downstream pool is not d3d12, will create new one");
         gst_clear_object (&pool);
       } else {
-        GstD3D12BufferPool *dpool = GST_D3D12_BUFFER_POOL (pool);
-        if (dpool->device != decoder->device) {
-          GST_DEBUG_OBJECT (videodec, "Different device, will create new one");
-          gst_clear_object (&pool);
-        }
-      }
-    } else if (priv->output_type == GST_D3D12_DECODER_OUTPUT_D3D11) {
-      if (!GST_IS_D3D11_BUFFER_POOL (pool)) {
-        GST_DEBUG_OBJECT (videodec,
-            "Downstream pool is not d3d11, will create new one");
-        gst_clear_object (&pool);
-      } else {
-        GstD3D11BufferPool *dpool = GST_D3D11_BUFFER_POOL (pool);
-        if (dpool->device != decoder->d3d11_device) {
+        auto dpool = GST_D3D12_BUFFER_POOL (pool);
+        if (!gst_d3d12_device_is_equal (dpool->device, decoder->device)) {
           GST_DEBUG_OBJECT (videodec, "Different device, will create new one");
           gst_clear_object (&pool);
         }
       }
     }
+#ifdef HAVE_GST_D3D11
+    if (priv->session->output_type == GST_D3D12_DECODER_OUTPUT_D3D11) {
+      if (!GST_IS_D3D12_BUFFER_POOL (pool)) {
+        GST_DEBUG_OBJECT (videodec,
+            "Downstream pool is not d3d11, will create new one");
+        gst_clear_object (&pool);
+      } else if (decoder->d3d11_interop) {
+        auto dpool = GST_D3D11_BUFFER_POOL (pool);
+        if (dpool->device != decoder->device11) {
+          GST_DEBUG_OBJECT (videodec, "Different device, will create new one");
+          gst_clear_object (&pool);
+        }
+      }
+    }
+#endif
   }
 
   if (!pool) {
-    switch (priv->output_type) {
+    switch (priv->session->output_type) {
       case GST_D3D12_DECODER_OUTPUT_D3D12:
         pool = gst_d3d12_buffer_pool_new (decoder->device);
         break;
+#ifdef HAVE_GST_D3D11
       case GST_D3D12_DECODER_OUTPUT_D3D11:
-        pool = gst_d3d11_buffer_pool_new (decoder->d3d11_device);
+        pool = gst_d3d11_buffer_pool_new (decoder->device11);
         break;
+#endif
       default:
         pool = gst_video_buffer_pool_new ();
         break;
@@ -1695,20 +2021,23 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
   gst_buffer_pool_config_set_params (config, outcaps, size, min, max);
   gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
 
-  if (priv->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
-    GstD3D12AllocationParams *params;
+  if (priv->session->output_type == GST_D3D12_DECODER_OUTPUT_D3D12) {
     GstVideoAlignment align;
     gint width, height;
 
     gst_video_alignment_reset (&align);
 
-    params = gst_buffer_pool_config_get_d3d12_allocation_params (config);
+    auto params = gst_buffer_pool_config_get_d3d12_allocation_params (config);
     if (!params) {
       params = gst_d3d12_allocation_params_new (decoder->device, &vinfo,
           GST_D3D12_ALLOCATION_FLAG_DEFAULT,
-          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+          D3D12_HEAP_FLAG_SHARED);
     } else {
-      params->desc[0].Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+      gst_d3d12_allocation_params_set_resource_flags (params,
+          D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
     }
 
     width = GST_VIDEO_INFO_WIDTH (&vinfo);
@@ -1720,56 +2049,20 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
     gst_d3d12_allocation_params_alignment (params, &align);
     gst_buffer_pool_config_set_d3d12_allocation_params (config, params);
     gst_d3d12_allocation_params_free (params);
-
-    /* Store min buffer size. We need to take account of the amount of buffers
-     * which might be held by downstream in case of zero-copy playback */
-    if (!priv->dpb_pool) {
-      if (n > 0) {
-        GST_DEBUG_OBJECT (videodec, "Downstream proposed pool");
-        priv->wait_on_pool_full = TRUE;
-        /* XXX: hardcoded bound 16, to avoid too large pool size */
-        priv->downstream_min_buffers = MIN (min, 16);
-      } else {
-        GST_DEBUG_OBJECT (videodec, "Downstream didn't propose pool");
-        priv->wait_on_pool_full = FALSE;
-        /* don't know how many buffers would be queued by downstream */
-        priv->downstream_min_buffers = 4;
-      }
-    } else {
-      /* We configured our DPB pool already, let's check if our margin can
-       * cover min size */
-      priv->wait_on_pool_full = FALSE;
-
-      if (n > 0) {
-        if (priv->downstream_min_buffers >= min)
-          priv->wait_on_pool_full = TRUE;
-
-        GST_DEBUG_OBJECT (videodec,
-            "Pre-allocated margin %d can%s cover downstream min size %d",
-            priv->downstream_min_buffers,
-            priv->wait_on_pool_full ? "" : "not", min);
-      } else {
-        GST_DEBUG_OBJECT (videodec, "Downstream min size is unknown");
-      }
+  }
+#ifdef HAVE_GST_D3D11
+  else if (priv->session->output_type == GST_D3D12_DECODER_OUTPUT_D3D11) {
+    auto params = gst_buffer_pool_config_get_d3d11_allocation_params (config);
+    if (!params) {
+      params = gst_d3d11_allocation_params_new (decoder->device11, &vinfo,
+          GST_D3D11_ALLOCATION_FLAG_DEFAULT,
+          D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0);
     }
 
-    GST_DEBUG_OBJECT (videodec, "Downstream min buffres: %d", min);
-
-    /* We will not use downstream pool for decoding, and therefore preallocation
-     * is unnecessary. So, Non-zero min buffer will be a waste of GPU memory */
-    min = 0;
-  } else if (priv->output_type == GST_D3D12_DECODER_OUTPUT_D3D11) {
-    GstD3D11AllocationParams *params;
-    const guint bind_flags = D3D11_BIND_SHADER_RESOURCE |
-        D3D11_BIND_RENDER_TARGET;
-    const guint misc_flags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
-        D3D11_RESOURCE_MISC_SHARED;
-
-    params = gst_d3d11_allocation_params_new (decoder->d3d11_device, &vinfo,
-        GST_D3D11_ALLOCATION_FLAG_DEFAULT, bind_flags, misc_flags);
     gst_buffer_pool_config_set_d3d11_allocation_params (config, params);
     gst_d3d11_allocation_params_free (params);
   }
+#endif
 
   gst_buffer_pool_set_config (pool, config);
   /* d3d12 buffer pool will update buffer size based on allocated texture,
@@ -1787,44 +2080,29 @@ gst_d3d12_decoder_decide_allocation (GstD3D12Decoder * decoder,
   return TRUE;
 }
 
-static void
-gst_d3d12_decoder_set_flushing (GstD3D12Decoder * self, gboolean flushing)
-{
-  GstD3D12DecoderPrivate *priv = self->priv;
-  std::lock_guard < std::mutex > lk (priv->lock);
-
-  if (priv->dpb_pool)
-    gst_buffer_pool_set_flushing (priv->dpb_pool, flushing);
-  if (priv->output_pool)
-    gst_buffer_pool_set_flushing (priv->output_pool, flushing);
-  priv->flushing = flushing;
-}
-
 void
 gst_d3d12_decoder_sink_event (GstD3D12Decoder * decoder, GstEvent * event)
 {
-  switch (GST_EVENT_TYPE (event)) {
-    case GST_EVENT_FLUSH_START:
-      gst_d3d12_decoder_set_flushing (decoder, TRUE);
-      break;
-    case GST_EVENT_FLUSH_STOP:
-      gst_d3d12_decoder_set_flushing (decoder, FALSE);
-      break;
-    default:
-      break;
-  }
 }
 
 void
 gst_d3d12_decoder_set_context (GstD3D12Decoder * decoder, GstElement * element,
     GstContext * context)
 {
-  GstD3D12CSLockGuard lk (&decoder->context_lock);
+  auto priv = decoder->priv;
 
+  std::lock_guard < std::recursive_mutex > lk (priv->context_lock);
   gst_d3d12_handle_set_context_for_adapter_luid (element,
       context, decoder->adapter_luid, &decoder->device);
-  gst_d3d11_handle_set_context_for_adapter_luid (element,
-      context, decoder->adapter_luid, &decoder->d3d11_device);
+#ifdef HAVE_GST_D3D11
+  if (decoder->d3d11_interop) {
+    gst_d3d11_handle_set_context_for_adapter_luid (element,
+        context, decoder->adapter_luid, &decoder->device11);
+  } else {
+    /* Since we will do system copy, accept any device */
+    gst_d3d11_handle_set_context (element, context, -1, &decoder->device11);
+  }
+#endif
 }
 
 gboolean
@@ -1834,13 +2112,14 @@ gst_d3d12_decoder_handle_query (GstD3D12Decoder * decoder, GstElement * element,
   if (GST_QUERY_TYPE (query) != GST_QUERY_CONTEXT)
     return FALSE;
 
-  GstD3D12CSLockGuard lk (&decoder->context_lock);
-  if (gst_d3d12_handle_context_query (element, query, decoder->device) ||
-      gst_d3d11_handle_context_query (element, query, decoder->d3d11_device)) {
+  auto priv = decoder->priv;
+  std::lock_guard < std::recursive_mutex > lk (priv->context_lock);
+#ifdef HAVE_GST_D3D11
+  if (gst_d3d11_handle_context_query (element, query, decoder->device11))
     return TRUE;
-  }
+#endif
 
-  return FALSE;
+  return gst_d3d12_handle_context_query (element, query, decoder->device);
 }
 
 enum
@@ -1850,19 +2129,15 @@ enum
   PROP_DECODER_VENDOR_ID,
 };
 
-struct _GstD3D12DecoderClassData
-{
-  GstD3D12DecoderSubClassData subclass_data;
-  GstCaps *sink_caps;
-  GstCaps *src_caps;
-  gchar *description;
-};
-
 static void
 gst_d3d12_decoder_get_profiles (const GUID & profile,
     std::vector < std::string > &list)
 {
-  if (profile == D3D12_VIDEO_DECODE_PROFILE_H264) {
+  if (profile == D3D12_VIDEO_DECODE_PROFILE_MPEG2 ||
+      profile == D3D12_VIDEO_DECODE_PROFILE_MPEG1_AND_MPEG2) {
+    list.push_back ("main");
+    list.push_back ("simple");
+  } else if (profile == D3D12_VIDEO_DECODE_PROFILE_H264) {
     list.push_back ("high");
     list.push_back ("progressive-high");
     list.push_back ("constrained-high");
@@ -1873,6 +2148,8 @@ gst_d3d12_decoder_get_profiles (const GUID & profile,
     list.push_back ("main");
   } else if (profile == D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10) {
     list.push_back ("main-10");
+  } else if (profile == D3D12_VIDEO_DECODE_PROFILE_VP8) {
+    /* skip profile field */
   } else if (profile == D3D12_VIDEO_DECODE_PROFILE_VP9) {
     list.push_back ("0");
   } else if (profile == D3D12_VIDEO_DECODE_PROFILE_VP9_10BIT_PROFILE2) {
@@ -1886,8 +2163,7 @@ gst_d3d12_decoder_get_profiles (const GUID & profile,
 
 GstD3D12DecoderClassData *
 gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
-    ID3D12VideoDevice * video_device, GstDxvaCodec codec,
-    gboolean d3d11_interop)
+    ID3D12VideoDevice * video_device, GstDxvaCodec codec)
 {
   HRESULT hr;
   GstDxvaResolution max_resolution = { 0, 0 };
@@ -1900,9 +2176,33 @@ gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
   g_return_val_if_fail (GST_IS_D3D12_DEVICE (device), nullptr);
   g_return_val_if_fail (video_device != nullptr, nullptr);
 
+  D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT profile_cnt = { };
+  hr = video_device->CheckFeatureSupport
+      (D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT, &profile_cnt,
+      sizeof (profile_cnt));
+  if (FAILED (hr) || profile_cnt.ProfileCount == 0) {
+    GST_INFO_OBJECT (device, "device does not support decoding");
+    return nullptr;
+  }
+
+  std::vector < GUID > profile_guids;
+  profile_guids.resize (profile_cnt.ProfileCount);
+  D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILES profiles_data = { };
+  profiles_data.ProfileCount = profile_cnt.ProfileCount;
+  profiles_data.pProfiles = profile_guids.data ();
+  hr = video_device->CheckFeatureSupport (D3D12_FEATURE_VIDEO_DECODE_PROFILES,
+      &profiles_data, sizeof (profiles_data));
+  if (!gst_d3d12_result (hr, device))
+    return nullptr;
+
   for (guint i = 0; i < G_N_ELEMENTS (format_list); i++) {
     if (format_list[i].codec != codec)
       continue;
+
+    if (std::find (profile_guids.begin (), profile_guids.end (),
+            format_list[i].decode_profile) == profile_guids.end ()) {
+      continue;
+    }
 
     D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT s;
     s.NodeIndex = 0;
@@ -1989,6 +2289,10 @@ gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
   std::string profile_string;
 
   switch (codec) {
+    case GST_DXVA_CODEC_MPEG2:
+      sink_caps_string = "video/mpeg, "
+          "mpegversion = (int) 2, systemstream = (boolean) false";
+      break;
     case GST_DXVA_CODEC_H264:
       sink_caps_string = "video/x-h264, "
           "stream-format=(string) { avc, avc3, byte-stream }, "
@@ -1998,6 +2302,9 @@ gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
       sink_caps_string = "video/x-h265, "
           "stream-format=(string) { hev1, hvc1, byte-stream }, "
           "alignment=(string) au";
+      break;
+    case GST_DXVA_CODEC_VP8:
+      sink_caps_string = "video/x-vp8";
       break;
     case GST_DXVA_CODEC_VP9:
       if (profiles.size () > 1) {
@@ -2023,7 +2330,7 @@ gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
   }
 
   /* *INDENT-OFF* */
-  if (codec != GST_DXVA_CODEC_VP9) {
+  if (codec != GST_DXVA_CODEC_VP9 && codec != GST_DXVA_CODEC_VP8) {
     if (profiles.size () > 1) {
       profile_string = "{ ";
       bool first = true;
@@ -2045,17 +2352,19 @@ gst_d3d12_decoder_check_feature_support (GstD3D12Device * device,
   }
   /* *INDENT-ON* */
 
-  GstCaps *sink_caps = gst_caps_from_string (sink_caps_string.c_str ());
-  GstCaps *raw_caps = gst_caps_from_string (src_caps_string.c_str ());
-  GstCaps *src_caps = gst_caps_copy (raw_caps);
+  auto sink_caps = gst_caps_from_string (sink_caps_string.c_str ());
+  auto raw_caps = gst_caps_from_string (src_caps_string.c_str ());
+  auto src_caps = gst_caps_copy (raw_caps);
   gst_caps_set_features_simple (src_caps,
-      gst_caps_features_new_single (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY));
-  if (d3d11_interop) {
-    GstCaps *d3d11_caps = gst_caps_copy (raw_caps);
-    gst_caps_set_features_simple (d3d11_caps,
-        gst_caps_features_new_single (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY));
-    gst_caps_append (src_caps, d3d11_caps);
-  }
+      gst_caps_features_new_single_static_str
+      (GST_CAPS_FEATURE_MEMORY_D3D12_MEMORY));
+#ifdef HAVE_GST_D3D11
+  auto d3d11_caps = gst_caps_copy (raw_caps);
+  gst_caps_set_features_simple (d3d11_caps,
+      gst_caps_features_new_single_static_str
+      (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY));
+  gst_caps_append (src_caps, d3d11_caps);
+#endif
   gst_caps_append (src_caps, raw_caps);
 
   gint max_res = MAX (max_resolution.width, max_resolution.height);

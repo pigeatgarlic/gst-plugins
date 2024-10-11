@@ -37,8 +37,6 @@
 #endif
 
 #include "gstd3d12av1dec.h"
-#include "gstd3d12device.h"
-#include "gstd3d12utils.h"
 #include <gst/dxva/gstdxvaav1decoder.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_d3d12_av1_dec_debug);
@@ -69,6 +67,7 @@ gst_d3d12_av1_dec_class_init (GstD3D12AV1DecClass * klass, gpointer data)
       "Seungha Yang <seungha@centricualr.com>");
 
   decoder_class->open = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_open);
+  decoder_class->stop = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_stop);
   decoder_class->close = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_close);
   decoder_class->negotiate = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_negotiate);
   decoder_class->decide_allocation =
@@ -76,6 +75,9 @@ gst_d3d12_av1_dec_class_init (GstD3D12AV1DecClass * klass, gpointer data)
   decoder_class->sink_query = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_sink_query);
   decoder_class->src_query = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_src_query);
   decoder_class->sink_event = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_sink_event);
+  decoder_class->drain = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_drain);
+  decoder_class->finish = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_finish);
+  decoder_class->flush = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_flush);
 
   dxva_class->configure = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_configure);
   dxva_class->new_picture = GST_DEBUG_FUNCPTR (gst_d3d12_av1_dec_new_picture);
@@ -93,17 +95,15 @@ gst_d3d12_av1_dec_class_init (GstD3D12AV1DecClass * klass, gpointer data)
 static void
 gst_d3d12_av1_dec_init (GstD3D12AV1Dec * self)
 {
-  GstD3D12AV1DecClass *klass = GST_D3D12_AV1_DEC_GET_CLASS (self);
-  GstD3D12DecoderSubClassData *cdata = &klass->class_data;
+  auto klass = GST_D3D12_AV1_DEC_GET_CLASS (self);
 
-  self->decoder = gst_d3d12_decoder_new (GST_DXVA_CODEC_AV1,
-      cdata->adapter_luid);
+  self->decoder = gst_d3d12_decoder_new (&klass->class_data);
 }
 
 static void
 gst_d3d12_av1_dec_finalize (GObject * object)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (object);
+  auto self = GST_D3D12_AV1_DEC (object);
 
   gst_object_unref (self->decoder);
 
@@ -114,8 +114,8 @@ static void
 gst_d3d12_av1_dec_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec)
 {
-  GstD3D12AV1DecClass *klass = GST_D3D12_AV1_DEC_GET_CLASS (object);
-  GstD3D12DecoderSubClassData *cdata = &klass->class_data;
+  auto klass = GST_D3D12_AV1_DEC_GET_CLASS (object);
+  auto cdata = &klass->class_data;
 
   gst_d3d12_decoder_proxy_get_property (object, prop_id, value, pspec, cdata);
 }
@@ -123,7 +123,7 @@ gst_d3d12_av1_dec_get_property (GObject * object, guint prop_id,
 static void
 gst_d3d12_av1_dec_set_context (GstElement * element, GstContext * context)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (element);
+  auto self = GST_D3D12_AV1_DEC (element);
 
   gst_d3d12_decoder_set_context (self->decoder, element, context);
 
@@ -133,15 +133,25 @@ gst_d3d12_av1_dec_set_context (GstElement * element, GstContext * context)
 static gboolean
 gst_d3d12_av1_dec_open (GstVideoDecoder * decoder)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_open (self->decoder, GST_ELEMENT (self));
 }
 
 static gboolean
+gst_d3d12_av1_dec_stop (GstVideoDecoder * decoder)
+{
+  auto self = GST_D3D12_AV1_DEC (decoder);
+
+  gst_d3d12_decoder_stop (self->decoder);
+
+  return GST_VIDEO_DECODER_CLASS (parent_class)->stop (decoder);
+}
+
+static gboolean
 gst_d3d12_av1_dec_close (GstVideoDecoder * decoder)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_close (self->decoder);
 }
@@ -149,7 +159,7 @@ gst_d3d12_av1_dec_close (GstVideoDecoder * decoder)
 static gboolean
 gst_d3d12_av1_dec_negotiate (GstVideoDecoder * decoder)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   if (!gst_d3d12_decoder_negotiate (self->decoder, decoder))
     return FALSE;
@@ -161,7 +171,7 @@ static gboolean
 gst_d3d12_av1_dec_decide_allocation (GstVideoDecoder * decoder,
     GstQuery * query)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   if (!gst_d3d12_decoder_decide_allocation (self->decoder, decoder, query)) {
     return FALSE;
@@ -174,7 +184,7 @@ gst_d3d12_av1_dec_decide_allocation (GstVideoDecoder * decoder,
 static gboolean
 gst_d3d12_av1_dec_sink_query (GstVideoDecoder * decoder, GstQuery * query)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   if (gst_d3d12_decoder_handle_query (self->decoder, GST_ELEMENT (self), query))
     return TRUE;
@@ -185,7 +195,7 @@ gst_d3d12_av1_dec_sink_query (GstVideoDecoder * decoder, GstQuery * query)
 static gboolean
 gst_d3d12_av1_dec_src_query (GstVideoDecoder * decoder, GstQuery * query)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   if (gst_d3d12_decoder_handle_query (self->decoder, GST_ELEMENT (self), query))
     return TRUE;
@@ -196,11 +206,44 @@ gst_d3d12_av1_dec_src_query (GstVideoDecoder * decoder, GstQuery * query)
 static gboolean
 gst_d3d12_av1_dec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   gst_d3d12_decoder_sink_event (self->decoder, event);
 
   return GST_VIDEO_DECODER_CLASS (parent_class)->sink_event (decoder, event);
+}
+
+static GstFlowReturn
+gst_d3d12_av1_dec_drain (GstVideoDecoder * decoder)
+{
+  auto self = GST_D3D12_AV1_DEC (decoder);
+
+  auto ret = GST_VIDEO_DECODER_CLASS (parent_class)->drain (decoder);
+  gst_d3d12_decoder_drain (self->decoder, decoder);
+
+  return ret;
+}
+
+static GstFlowReturn
+gst_d3d12_av1_dec_finish (GstVideoDecoder * decoder)
+{
+  auto self = GST_D3D12_AV1_DEC (decoder);
+
+  auto ret = GST_VIDEO_DECODER_CLASS (parent_class)->finish (decoder);
+  gst_d3d12_decoder_drain (self->decoder, decoder);
+
+  return ret;
+}
+
+static gboolean
+gst_d3d12_av1_dec_flush (GstVideoDecoder * decoder)
+{
+  auto self = GST_D3D12_AV1_DEC (decoder);
+
+  auto ret = GST_VIDEO_DECODER_CLASS (parent_class)->flush (decoder);
+  gst_d3d12_decoder_flush (self->decoder, decoder);
+
+  return ret;
 }
 
 static GstFlowReturn
@@ -209,17 +252,18 @@ gst_d3d12_av1_dec_configure (GstDxvaAV1Decoder * decoder,
     gint crop_x, gint crop_y, gint coded_width, gint coded_height,
     gint max_dpb_size)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
+  auto videodec = GST_VIDEO_DECODER (decoder);
 
-  return gst_d3d12_decoder_configure (self->decoder, input_state, info,
-      crop_x, crop_y, coded_width, coded_height, max_dpb_size);
+  return gst_d3d12_decoder_configure (self->decoder, videodec, input_state,
+      info, crop_x, crop_y, coded_width, coded_height, max_dpb_size);
 }
 
 static GstFlowReturn
 gst_d3d12_av1_dec_new_picture (GstDxvaAV1Decoder * decoder,
     GstCodecPicture * picture)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_new_picture (self->decoder,
       GST_VIDEO_DECODER (decoder), picture);
@@ -229,7 +273,7 @@ static GstFlowReturn
 gst_d3d12_av1_dec_duplicate_picture (GstDxvaAV1Decoder * decoder,
     GstCodecPicture * src, GstCodecPicture * dst)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_duplicate_picture (self->decoder, src, dst);
 }
@@ -238,7 +282,7 @@ static guint8
 gst_d3d12_av1_dec_get_picture_id (GstDxvaAV1Decoder * decoder,
     GstCodecPicture * picture)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_get_picture_id (self->decoder, picture);
 }
@@ -247,7 +291,7 @@ static GstFlowReturn
 gst_d3d12_av1_dec_start_picture (GstDxvaAV1Decoder * decoder,
     GstCodecPicture * picture, guint8 * picture_id)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_start_picture (self->decoder, picture, picture_id);
 }
@@ -257,7 +301,7 @@ gst_d3d12_av1_dec_end_picture (GstDxvaAV1Decoder * decoder,
     GstCodecPicture * picture, GPtrArray * ref_pics,
     const GstDxvaDecodingArgs * args)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_end_picture (self->decoder, picture, ref_pics, args);
 }
@@ -267,7 +311,7 @@ gst_d3d12_av1_dec_output_picture (GstDxvaAV1Decoder * decoder,
     GstVideoCodecFrame * frame, GstCodecPicture * picture,
     GstVideoBufferFlags buffer_flags, gint display_width, gint display_height)
 {
-  GstD3D12AV1Dec *self = GST_D3D12_AV1_DEC (decoder);
+  auto self = GST_D3D12_AV1_DEC (decoder);
 
   return gst_d3d12_decoder_output_picture (self->decoder,
       GST_VIDEO_DECODER (decoder), frame, picture,
@@ -297,11 +341,13 @@ gst_d3d12_av1_dec_register (GstPlugin * plugin, GstD3D12Device * device,
   GST_DEBUG_CATEGORY_INIT (gst_d3d12_av1_dec_debug, "d3d12av1dec", 0,
       "d3d12av1dec");
 
-  type_info.class_data =
-      gst_d3d12_decoder_check_feature_support (device, video_device,
-      GST_DXVA_CODEC_AV1, d3d11_interop);
-  if (!type_info.class_data)
+  auto cdata = gst_d3d12_decoder_check_feature_support (device, video_device,
+      GST_DXVA_CODEC_AV1);
+  if (!cdata)
     return;
+
+  cdata->subclass_data.d3d11_interop = d3d11_interop;
+  type_info.class_data = cdata;
 
   type_name = g_strdup ("GstD3D12AV1Dec");
   feature_name = g_strdup ("d3d12av1dec");
@@ -310,7 +356,7 @@ gst_d3d12_av1_dec_register (GstPlugin * plugin, GstD3D12Device * device,
     index++;
     g_free (type_name);
     g_free (feature_name);
-    type_name = g_strdup_printf ("GstD3D12Vp9Device%dDec", index);
+    type_name = g_strdup_printf ("GstD3D12AV1Device%dDec", index);
     feature_name = g_strdup_printf ("d3d12av1device%ddec", index);
   }
 
@@ -320,6 +366,9 @@ gst_d3d12_av1_dec_register (GstPlugin * plugin, GstD3D12Device * device,
   /* make lower rank than default device */
   if (rank > 0 && index != 0)
     rank--;
+
+  if (index != 0)
+    gst_element_type_set_skip_documentation (type);
 
   if (!gst_element_register (plugin, feature_name, rank, type))
     GST_WARNING ("Failed to register plugin '%s'", type_name);

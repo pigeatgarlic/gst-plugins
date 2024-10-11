@@ -1181,6 +1181,18 @@ static gboolean gst_avf_video_src_decide_allocation (GstBaseSrc * bsrc,
 static void gst_avf_video_src_set_context (GstElement * element,
         GstContext * context);
 
+void
+gst_avf_video_src_debug_init (void)
+{
+  static gsize _init = 0;
+
+  if (g_once_init_enter (&_init)) {
+    GST_DEBUG_CATEGORY_INIT (gst_avf_video_src_debug, "avfvideosrc",
+        0, "iOS/MacOS AVFoundation video source");
+    g_once_init_leave (&_init, 1);
+  }
+}
+
 static void
 gst_avf_video_src_class_init (GstAVFVideoSrcClass * klass)
 {
@@ -1277,8 +1289,7 @@ gst_avf_video_src_class_init (GstAVFVideoSrcClass * klass)
           0, G_MAXUINT, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 #endif
 
-  GST_DEBUG_CATEGORY_INIT (gst_avf_video_src_debug, "avfvideosrc",
-      0, "iOS/MacOS AVFoundation video source");
+  gst_avf_video_src_debug_init ();
 
   gst_type_mark_as_plugin_api (GST_TYPE_AVF_VIDEO_SOURCE_POSITION, 0);
   gst_type_mark_as_plugin_api (GST_TYPE_AVF_VIDEO_SOURCE_ORIENTATION, 0);
@@ -1582,7 +1593,7 @@ gst_av_capture_device_get_caps (AVCaptureDevice *device, AVCaptureVideoDataOutpu
           gst_caps_append (result_caps, gst_caps_copy (caps));
           /* Set GLMemory features on caps */
           gst_caps_set_features (caps, 0,
-                                 gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_GL_MEMORY,
+                                 gst_caps_features_new_static_str (GST_CAPS_FEATURE_MEMORY_GL_MEMORY,
                                                         NULL));
           gst_caps_set_simple (caps,
                                "texture-target", G_TYPE_STRING,

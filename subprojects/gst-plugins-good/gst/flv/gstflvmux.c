@@ -1180,8 +1180,7 @@ gst_flv_mux_create_metadata (GstFlvMux * mux)
   tag_string = NULL;
 
   {
-    time_t secs;
-    struct tm tm;
+    GDateTime *now;
     gchar *s;
     static const gchar *weekdays[] = {
       "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
@@ -1191,16 +1190,15 @@ gst_flv_mux_create_metadata (GstFlvMux * mux)
       "Aug", "Sep", "Oct", "Nov", "Dec"
     };
 
-    secs = g_get_real_time () / G_USEC_PER_SEC;
-#ifdef HAVE_GMTIME_R
-    gmtime_r (&secs, &tm);
-#else
-    tm = *gmtime (&secs);
-#endif
+    now = g_date_time_new_now_utc ();
 
-    s = g_strdup_printf ("%s %s %d %02d:%02d:%02d %d", weekdays[tm.tm_wday],
-        months[tm.tm_mon], tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-        tm.tm_year + 1900);
+    s = g_strdup_printf ("%s %s %u %02u:%02u:%02u %u",
+        weekdays[g_date_time_get_day_of_week (now)],
+        months[g_date_time_get_month (now)], g_date_time_get_day_of_month (now),
+        g_date_time_get_hour (now), g_date_time_get_minute (now),
+        g_date_time_get_second (now), g_date_time_get_year (now));
+
+    g_date_time_unref (now);
 
     _gst_buffer_new_and_alloc (2 + 12 + 1 + 2 + strlen (s), &tmp, &data);
     data[0] = 0;                /* 12 bytes name */
@@ -1700,7 +1698,9 @@ gst_flv_mux_write_buffer (GstFlvMux * mux, GstFlvMuxPad * pad,
 {
   GstBuffer *tag;
   GstFlowReturn ret;
-  GstClockTime pts = GST_BUFFER_PTS (buffer);
+  GstClockTime pts =
+      gst_flv_mux_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment,
+      GST_BUFFER_PTS (buffer));
   GstClockTime duration = GST_BUFFER_DURATION (buffer);
   GstClockTime dts =
       gst_flv_mux_segment_to_running_time (&GST_AGGREGATOR_PAD (pad)->segment,
@@ -1824,7 +1824,6 @@ static GstFlowReturn
 gst_flv_mux_rewrite_header (GstFlvMux * mux)
 {
   GstBuffer *rewrite, *index, *tmp;
-  GstEvent *event;
   guint8 *data;
   gdouble d;
   GList *l;
@@ -1839,11 +1838,7 @@ gst_flv_mux_rewrite_header (GstFlvMux * mux)
   /* seek back to the preallocated index space */
   gst_segment_init (&segment, GST_FORMAT_BYTES);
   segment.start = segment.time = 13 + 29;
-  event = gst_event_new_segment (&segment);
-  if (!gst_pad_push_event (mux->srcpad, event)) {
-    GST_WARNING_OBJECT (mux, "Seek to rewrite header failed");
-    return GST_FLOW_OK;
-  }
+  gst_aggregator_update_segment (GST_AGGREGATOR (mux), &segment);
 
   /* determine duration now based on our own timestamping,
    * so that it is likely many times better and consistent

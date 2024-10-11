@@ -213,7 +213,7 @@ static gboolean gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
 static gboolean gst_adaptive_demux_src_event (GstPad * pad, GstObject * parent,
     GstEvent * event);
 static gboolean gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux,
-    GstEvent * event);
+    GstEvent * event, gboolean lost_sync);
 static gboolean gst_adaptive_demux_handle_select_streams_event (GstAdaptiveDemux
     * demux, GstEvent * event);
 
@@ -740,13 +740,13 @@ gst_adaptive_demux_output_slot_free (GstAdaptiveDemux * demux,
 
 static OutputSlot *
 gst_adaptive_demux_output_slot_new (GstAdaptiveDemux * demux,
-    GstStreamType streamtype)
+    GstAdaptiveDemuxTrack * track)
 {
   OutputSlot *slot;
   GstPadTemplate *tmpl;
   gchar *name;
 
-  switch (streamtype) {
+  switch (track->type) {
     case GST_STREAM_TYPE_AUDIO:
       name = g_strdup_printf ("audio_%02u", demux->priv->n_audio_streams++);
       tmpl =
@@ -770,7 +770,8 @@ gst_adaptive_demux_output_slot_new (GstAdaptiveDemux * demux,
   }
 
   slot = g_new0 (OutputSlot, 1);
-  slot->type = streamtype;
+  slot->type = track->type;
+  slot->track = gst_adaptive_demux_track_ref (track);
   slot->pushed_timed_data = FALSE;
 
   /* Create and activate new pads */
@@ -778,16 +779,16 @@ gst_adaptive_demux_output_slot_new (GstAdaptiveDemux * demux,
   g_free (name);
   gst_object_unref (tmpl);
 
-  gst_element_add_pad (GST_ELEMENT_CAST (demux), slot->pad);
-  gst_flow_combiner_add_pad (demux->priv->flowcombiner, slot->pad);
-  gst_pad_set_active (slot->pad, TRUE);
-
   gst_pad_set_query_function (slot->pad,
       GST_DEBUG_FUNCPTR (gst_adaptive_demux_src_query));
   gst_pad_set_event_function (slot->pad,
       GST_DEBUG_FUNCPTR (gst_adaptive_demux_src_event));
 
   gst_pad_set_element_private (slot->pad, slot);
+
+  gst_element_add_pad (GST_ELEMENT_CAST (demux), slot->pad);
+  gst_flow_combiner_add_pad (demux->priv->flowcombiner, slot->pad);
+  gst_pad_set_active (slot->pad, TRUE);
 
   GST_INFO_OBJECT (demux, "Created output slot %s:%s",
       GST_DEBUG_PAD_NAME (slot->pad));
@@ -982,10 +983,11 @@ handle_incoming_manifest (GstAdaptiveDemux * demux)
 
     if (!g_str_has_prefix (demux->manifest_uri, "data:")
         && !g_str_has_prefix (demux->manifest_uri, "http://")
-        && !g_str_has_prefix (demux->manifest_uri, "https://")) {
+        && !g_str_has_prefix (demux->manifest_uri, "https://")
+        && !g_str_has_prefix (demux->manifest_uri, "file://")) {
       GST_ELEMENT_ERROR (demux, STREAM, DEMUX,
           (_("Invalid manifest URI")),
-          ("Manifest URI needs to use either data:, http:// or https://"));
+          ("Manifest URI needs to use either data:, http://, https:// or file://"));
       gst_query_unref (query);
       ret = FALSE;
       goto unlock_out;
@@ -1105,12 +1107,12 @@ struct http_headers_collector
 };
 
 static gboolean
-gst_adaptive_demux_handle_upstream_http_header (GQuark field_id,
+gst_adaptive_demux_handle_upstream_http_header (const GstIdStr * fieldname,
     const GValue * value, gpointer userdata)
 {
   struct http_headers_collector *hdr_data = userdata;
   GstAdaptiveDemux *demux = hdr_data->demux;
-  const gchar *field_name = g_quark_to_string (field_id);
+  const gchar *field_name = gst_id_str_as_str (fieldname);
 
   if (G_UNLIKELY (value == NULL))
     return TRUE;                /* This should not happen */
@@ -1135,7 +1137,7 @@ gst_adaptive_demux_handle_upstream_http_header (GQuark field_id,
       cookies = (gchar **) g_malloc0 ((total_len + 1) * sizeof (gchar *));
 
       for (i = 0; i < gst_value_array_get_size (value); i++) {
-        GST_INFO_OBJECT (demux, "%s : %s", g_quark_to_string (field_id),
+        GST_INFO_OBJECT (demux, "%s : %s", gst_id_str_as_str (fieldname),
             g_value_get_string (gst_value_array_get_value (value, i)));
         cookies[i] = g_value_dup_string (gst_value_array_get_value (value, i));
       }
@@ -1143,12 +1145,12 @@ gst_adaptive_demux_handle_upstream_http_header (GQuark field_id,
       total_len = 1 + prev_len;
       cookies = (gchar **) g_malloc0 ((total_len + 1) * sizeof (gchar *));
 
-      GST_INFO_OBJECT (demux, "%s : %s", g_quark_to_string (field_id),
+      GST_INFO_OBJECT (demux, "%s : %s", gst_id_str_as_str (fieldname),
           g_value_get_string (value));
       cookies[0] = g_value_dup_string (value);
     } else {
       GST_WARNING_OBJECT (demux, "%s field is not string or array",
-          g_quark_to_string (field_id));
+          gst_id_str_as_str (fieldname));
     }
 
     if (cookies) {
@@ -1258,7 +1260,7 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
           gst_structure_get (structure, "request-headers", GST_TYPE_STRUCTURE,
               &req_headers, NULL);
           if (req_headers) {
-            gst_structure_foreach (req_headers,
+            gst_structure_foreach_id_str (req_headers,
                 gst_adaptive_demux_handle_upstream_http_header, &c);
             gst_structure_free (req_headers);
           }
@@ -1268,7 +1270,7 @@ gst_adaptive_demux_sink_event (GstPad * pad, GstObject * parent,
           gst_structure_get (structure, "response-headers", GST_TYPE_STRUCTURE,
               &res_headers, NULL);
           if (res_headers) {
-            gst_structure_foreach (res_headers,
+            gst_structure_foreach_id_str (res_headers,
                 gst_adaptive_demux_handle_upstream_http_header, &c);
             gst_structure_free (res_headers);
           }
@@ -1405,6 +1407,8 @@ gst_adaptive_demux_reset (GstAdaptiveDemux * demux)
   demux->priv->segment_seqnum = gst_util_seqnum_next ();
 
   demux->priv->global_output_position = 0;
+  demux->priv->initial_output_position = 0;
+  demux->priv->base_offset = 0;
 
   demux->priv->n_audio_streams = 0;
   demux->priv->n_video_streams = 0;
@@ -1424,7 +1428,7 @@ gst_adaptive_demux_send_event (GstElement * element, GstEvent * event)
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_SEEK:
     {
-      res = gst_adaptive_demux_handle_seek_event (demux, event);
+      res = gst_adaptive_demux_handle_seek_event (demux, event, FALSE);
       break;
     }
     case GST_EVENT_SELECT_STREAMS:
@@ -2007,9 +2011,16 @@ gst_adaptive_demux_setup_streams_for_restart (GstAdaptiveDemux * demux,
                               GST_SEEK_FLAG_SNAP_AFTER | \
                               GST_SEEK_FLAG_SNAP_NEAREST))
 
+/**
+ * gst_adaptive_demux_handle_seek_event:
+ * @demux:
+ * @event: The seek event
+ * @lost_sync: TRUE if this triggered by a "lost sync" and not an external seek
+ *
+ */
 static gboolean
 gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux,
-    GstEvent * event)
+    GstEvent * event, gboolean lost_sync)
 {
   GstAdaptiveDemuxClass *demux_class = GST_ADAPTIVE_DEMUX_GET_CLASS (demux);
   gdouble rate;
@@ -2182,11 +2193,13 @@ gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux,
   /* have a backup in case seek fails */
   gst_segment_copy_into (&demux->segment, &oldsegment);
 
-  GST_DEBUG_OBJECT (demux, "sending flush start");
-  flush_event = gst_event_new_flush_start ();
-  gst_event_set_seqnum (flush_event, seqnum);
+  if (!lost_sync) {
+    GST_DEBUG_OBJECT (demux, "sending flush start");
+    flush_event = gst_event_new_flush_start ();
+    gst_event_set_seqnum (flush_event, seqnum);
 
-  gst_adaptive_demux_push_src_event (demux, flush_event);
+    gst_adaptive_demux_push_src_event (demux, flush_event);
+  }
 
   gst_adaptive_demux_stop_tasks (demux, FALSE);
   gst_adaptive_demux_reset_tracks (demux);
@@ -2306,10 +2319,12 @@ gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux,
   /* Resetting flow combiner */
   gst_flow_combiner_reset (demux->priv->flowcombiner);
 
-  GST_DEBUG_OBJECT (demux, "Sending flush stop on all pad");
-  flush_event = gst_event_new_flush_stop (TRUE);
-  gst_event_set_seqnum (flush_event, seqnum);
-  gst_adaptive_demux_push_src_event (demux, flush_event);
+  if (!lost_sync) {
+    GST_DEBUG_OBJECT (demux, "Sending flush stop on all pad");
+    flush_event = gst_event_new_flush_stop (TRUE);
+    gst_event_set_seqnum (flush_event, seqnum);
+    gst_adaptive_demux_push_src_event (demux, flush_event);
+  }
 
   /* If the seek generated a new period, prepare it */
   if (!demux->input_period->prepared) {
@@ -2324,8 +2339,19 @@ gst_adaptive_demux_handle_seek_event (GstAdaptiveDemux * demux,
   gst_adaptive_demux_setup_streams_for_restart (demux, start_type, stop_type);
   demux->priv->qos_earliest_time = GST_CLOCK_TIME_NONE;
 
-  /* Reset the global output position (running time) for when the output loop restarts */
-  demux->priv->global_output_position = 0;
+  if (!lost_sync) {
+    /* Reset the global output position (running time) for when the output loop restarts */
+    demux->priv->global_output_position = 0;
+    demux->priv->initial_output_position = demux->priv->base_offset = 0;
+  } else {
+    /* When dealing with lost-sync, we don't reset the global output position
+     * (running time), but we do need to take into account how much was played
+     * previously to add it to the outgoing segment base */
+    demux->priv->base_offset =
+        demux->priv->global_output_position -
+        demux->priv->initial_output_position;
+    demux->priv->initial_output_position = demux->priv->global_output_position;
+  }
 
   /* After a flushing seek, any instant-rate override is undone */
   demux->instant_rate_multiplier = 1.0;
@@ -2518,7 +2544,7 @@ gst_adaptive_demux_src_event (GstPad * pad, GstObject * parent,
         gst_event_unref (event);
         return TRUE;
       }
-      return gst_adaptive_demux_handle_seek_event (demux, event);
+      return gst_adaptive_demux_handle_seek_event (demux, event, FALSE);
     }
     case GST_EVENT_LATENCY:{
       /* Upstream and our internal source are irrelevant
@@ -2535,7 +2561,7 @@ gst_adaptive_demux_src_event (GstPad * pad, GstObject * parent,
       gst_event_parse_qos (event, NULL, NULL, &diff, &timestamp);
       /* Only take into account lateness if late */
       if (diff > 0)
-        earliest_time = timestamp + 2 * diff;
+        earliest_time = timestamp + MIN (2 * diff, GST_SECOND);
       else
         earliest_time = timestamp;
 
@@ -2649,6 +2675,17 @@ gst_adaptive_demux_src_query (GstPad * pad, GstObject * parent,
           GST_TIME_FORMAT, ret ? "TRUE" : "FALSE", GST_TIME_ARGS (duration));
       break;
     }
+    case GST_QUERY_CAPS:
+    {
+      OutputSlot *slot = gst_pad_get_element_private (pad);
+      if (slot->track && slot->track->generic_caps) {
+        GST_DEBUG_OBJECT (demux, "Answering caps query %" GST_PTR_FORMAT,
+            slot->track->generic_caps);
+        gst_query_set_caps_result (query, slot->track->generic_caps);
+        ret = TRUE;
+      }
+      break;
+    }
     case GST_QUERY_LATENCY:{
       gst_query_set_latency (query, FALSE, 0, -1);
       ret = TRUE;
@@ -2735,7 +2772,7 @@ gst_adaptive_demux_handle_lost_sync (GstAdaptiveDemux * demux)
       gst_event_new_seek (1.0, GST_FORMAT_TIME,
       GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, GST_SEEK_TYPE_END, 0,
       GST_SEEK_TYPE_NONE, 0);
-  gst_adaptive_demux_handle_seek_event (demux, seek);
+  gst_adaptive_demux_handle_seek_event (demux, seek, TRUE);
   return FALSE;
 }
 
@@ -3171,13 +3208,12 @@ check_and_handle_selection_update_locked (GstAdaptiveDemux * demux)
         }
       } else {
         /* 2. There is no compatible replacement slot, create a new one */
-        slot = gst_adaptive_demux_output_slot_new (demux, track->type);
+        slot = gst_adaptive_demux_output_slot_new (demux, track);
         GST_DEBUG_OBJECT (demux, "Created slot for track '%s'", track->id);
         demux->priv->outputs = g_list_append (demux->priv->outputs, slot);
 
         track->update_next_segment = TRUE;
 
-        slot->track = gst_adaptive_demux_track_ref (track);
         track->active = TRUE;
         gst_adaptive_demux_send_initial_events (demux, slot);
       }
@@ -3289,7 +3325,7 @@ handle_slot_pending_track_switch_locked (GstAdaptiveDemux * demux,
       slot->pending_track->buffering_threshold);
   pending_is_ready |= slot->pending_track->eos;
 
-  if (!pending_is_ready && gst_queue_array_get_length (track->queue) > 0) {
+  if (!pending_is_ready && gst_vec_deque_get_length (track->queue) > 0) {
     GST_DEBUG_OBJECT (demux,
         "Replacement track '%s' doesn't have enough data for switching yet",
         slot->pending_track->id);
@@ -3424,7 +3460,7 @@ restart:
     } else {
       GST_DEBUG_ID (track->id, "Track is EOS, not waiting for timed data");
 
-      if (gst_queue_array_get_length (track->queue) > 0) {
+      if (gst_vec_deque_get_length (track->queue) > 0) {
         all_tracks_empty = FALSE;
       }
     }

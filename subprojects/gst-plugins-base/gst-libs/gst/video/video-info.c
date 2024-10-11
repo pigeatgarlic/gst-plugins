@@ -605,6 +605,10 @@ gst_video_info_is_equal (const GstVideoInfo * info, const GstVideoInfo * other)
 {
   gint i;
 
+  if (info == other)
+    return TRUE;
+  if (info->finfo == NULL || other->finfo == NULL)
+    return FALSE;
   if (GST_VIDEO_INFO_FORMAT (info) != GST_VIDEO_INFO_FORMAT (other))
     return FALSE;
   if (GST_VIDEO_INFO_INTERLACE_MODE (info) !=
@@ -674,7 +678,7 @@ gst_video_info_to_caps (const GstVideoInfo * info)
   format = gst_video_format_to_string (info->finfo->format);
   g_return_val_if_fail (format != NULL, NULL);
 
-  caps = gst_caps_new_simple ("video/x-raw",
+  caps = gst_caps_new_simple_static_str ("video/x-raw",
       "format", G_TYPE_STRING, format,
       "width", G_TYPE_INT, info->width,
       "height", G_TYPE_INT, info->height, NULL);
@@ -682,13 +686,13 @@ gst_video_info_to_caps (const GstVideoInfo * info)
   par_n = info->par_n;
   par_d = info->par_d;
 
-  gst_caps_set_simple (caps, "interlace-mode", G_TYPE_STRING,
+  gst_caps_set_simple_static_str (caps, "interlace-mode", G_TYPE_STRING,
       gst_video_interlace_mode_to_string (info->interlace_mode), NULL);
 
   if ((info->interlace_mode == GST_VIDEO_INTERLACE_MODE_INTERLEAVED ||
           info->interlace_mode == GST_VIDEO_INTERLACE_MODE_ALTERNATE) &&
       GST_VIDEO_INFO_FIELD_ORDER (info) != GST_VIDEO_FIELD_ORDER_UNKNOWN) {
-    gst_caps_set_simple (caps, "field-order", G_TYPE_STRING,
+    gst_caps_set_simple_static_str (caps, "field-order", G_TYPE_STRING,
         gst_video_field_order_to_string (GST_VIDEO_INFO_FIELD_ORDER (info)),
         NULL);
   }
@@ -698,7 +702,9 @@ gst_video_info_to_caps (const GstVideoInfo * info)
      */
     GstCapsFeatures *features;
 
-    features = gst_caps_features_new (GST_CAPS_FEATURE_FORMAT_INTERLACED, NULL);
+    features =
+        gst_caps_features_new_static_str (GST_CAPS_FEATURE_FORMAT_INTERLACED,
+        NULL);
     gst_caps_set_features (caps, 0, features);
   }
 
@@ -732,13 +738,13 @@ gst_video_info_to_caps (const GstVideoInfo * info)
         gst_video_multiview_mode_to_caps_string (GST_VIDEO_INFO_MULTIVIEW_MODE
         (info));
     if (caps_str != NULL) {
-      gst_caps_set_simple (caps, "multiview-mode", G_TYPE_STRING,
+      gst_caps_set_simple_static_str (caps, "multiview-mode", G_TYPE_STRING,
           caps_str, "multiview-flags", GST_TYPE_VIDEO_MULTIVIEW_FLAGSET,
           multiview_flags, GST_FLAG_SET_MASK_EXACT, NULL);
     }
   }
 
-  gst_caps_set_simple (caps, "pixel-aspect-ratio",
+  gst_caps_set_simple_static_str (caps, "pixel-aspect-ratio",
       GST_TYPE_FRACTION, par_n, par_d, NULL);
 
   if (info->chroma_site != GST_VIDEO_CHROMA_SITE_UNKNOWN) {
@@ -748,7 +754,7 @@ gst_video_info_to_caps (const GstVideoInfo * info)
       GST_WARNING ("Couldn't convert chroma-site 0x%x to string",
           info->chroma_site);
     } else {
-      gst_caps_set_simple (caps,
+      gst_caps_set_simple_static_str (caps,
           "chroma-site", G_TYPE_STRING, chroma_site, NULL);
       g_free (chroma_site);
     }
@@ -763,20 +769,22 @@ gst_video_info_to_caps (const GstVideoInfo * info)
     colorimetry.matrix = GST_VIDEO_COLOR_MATRIX_RGB;
   }
   if ((color = gst_video_colorimetry_to_string (&colorimetry))) {
-    gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, color, NULL);
+    gst_caps_set_simple_static_str (caps, "colorimetry", G_TYPE_STRING, color,
+        NULL);
     g_free (color);
   }
 
   if (info->views > 1)
-    gst_caps_set_simple (caps, "views", G_TYPE_INT, info->views, NULL);
+    gst_caps_set_simple_static_str (caps, "views", G_TYPE_INT, info->views,
+        NULL);
 
   if (info->flags & GST_VIDEO_FLAG_VARIABLE_FPS && info->fps_n != 0) {
     /* variable fps with a max-framerate */
-    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1,
+    gst_caps_set_simple_static_str (caps, "framerate", GST_TYPE_FRACTION, 0, 1,
         "max-framerate", GST_TYPE_FRACTION, info->fps_n, info->fps_d, NULL);
   } else {
     /* no variable fps or no max-framerate */
-    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION,
+    gst_caps_set_simple_static_str (caps, "framerate", GST_TYPE_FRACTION,
         info->fps_n, info->fps_d, NULL);
   }
 
@@ -825,6 +833,7 @@ fill_planes (GstVideoInfo * info, gsize plane_size[GST_VIDEO_MAX_PLANES])
     case GST_VIDEO_FORMAT_VUYA:
     case GST_VIDEO_FORMAT_BGR10A2_LE:
     case GST_VIDEO_FORMAT_RGB10A2_LE:
+    case GST_VIDEO_FORMAT_RBGA:
       info->stride[0] = width * 4;
       info->offset[0] = 0;
       info->size = info->stride[0] * height;
@@ -854,6 +863,8 @@ fill_planes (GstVideoInfo * info, gsize plane_size[GST_VIDEO_MAX_PLANES])
     case GST_VIDEO_FORMAT_Y210:
     case GST_VIDEO_FORMAT_Y212_BE:
     case GST_VIDEO_FORMAT_Y212_LE:
+    case GST_VIDEO_FORMAT_Y216_BE:
+    case GST_VIDEO_FORMAT_Y216_LE:
       info->stride[0] = GST_ROUND_UP_8 (width * 4);
       info->offset[0] = 0;
       info->size = info->stride[0] * height;
@@ -899,6 +910,8 @@ fill_planes (GstVideoInfo * info, gsize plane_size[GST_VIDEO_MAX_PLANES])
     case GST_VIDEO_FORMAT_AYUV64:
     case GST_VIDEO_FORMAT_Y412_BE:
     case GST_VIDEO_FORMAT_Y412_LE:
+    case GST_VIDEO_FORMAT_Y416_BE:
+    case GST_VIDEO_FORMAT_Y416_LE:
       info->stride[0] = width * 8;
       info->offset[0] = 0;
       info->size = info->stride[0] * height;
@@ -1145,7 +1158,7 @@ fill_planes (GstVideoInfo * info, gsize plane_size[GST_VIDEO_MAX_PLANES])
       const gsize y_tile_size =
           GST_VIDEO_FORMAT_INFO_TILE_SIZE (info->finfo, 0);
       const gsize uv_tile_size =
-          GST_VIDEO_FORMAT_INFO_TILE_SIZE (info->finfo, 0);
+          GST_VIDEO_FORMAT_INFO_TILE_SIZE (info->finfo, 1);
       gint tile_width = GST_VIDEO_FORMAT_INFO_TILE_WIDTH (info->finfo, 0);
       gint tile_height = GST_VIDEO_FORMAT_INFO_TILE_HEIGHT (info->finfo, 0);
       gint n_tile_x = GST_ROUND_UP_N (info->width, tile_width) / tile_width;

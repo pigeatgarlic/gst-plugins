@@ -42,6 +42,8 @@
 #include <string.h>
 #include <d2d1.h>
 #include <math.h>
+#include <memory>
+#include <vector>
 
 /* *INDENT-OFF* */
 using namespace Microsoft::WRL;
@@ -187,49 +189,52 @@ enum
   COLOR_DARK_GREY,
 };
 
-typedef struct
+struct SnowConstBuffer
 {
-  FLOAT time;
-  FLOAT alpha;
+  FLOAT time = 0.0f;
+  FLOAT alpha = 1.0f;
   FLOAT padding[2];
-} SnowConstBuffer;
+};
 
-typedef struct
+struct CheckerConstBuffer
 {
   FLOAT width;
   FLOAT height;
   FLOAT checker_size;
-  FLOAT alpha;
-} CheckerConstBuffer;
+  FLOAT alpha = 1.0f;
+};
 
-typedef struct
+struct GstD3D11TestSrcQuad
 {
-  ID3D11PixelShader *ps;
-  ID3D11VertexShader *vs;
-  ID3D11InputLayout *layout;
-  ID3D11Buffer *vertex_buffer;
-  ID3D11Buffer *index_buffer;
-  ID3D11Buffer *const_buffer;
-  guint vertex_stride;
-  guint index_count;
-  gboolean is_checker;
-  gboolean is_snow;
+  ComPtr < ID3D11PixelShader > ps;
+  ComPtr < ID3D11VertexShader > vs;
+  ComPtr < ID3D11InputLayout > layout;
+  ComPtr < ID3D11Buffer > vertex_buffer;
+  ComPtr < ID3D11Buffer > index_buffer;
+  ComPtr < ID3D11Buffer > const_buffer;
+  guint vertex_stride = 0;
+  guint index_count = 0;
+  gboolean is_checker = FALSE;
+  gboolean is_snow = FALSE;
   CheckerConstBuffer checker_const_buffer;
   SnowConstBuffer snow_const_buffer;
-} GstD3D11TestSrcQuad;
+};
 
-typedef struct
+struct StaticColor
 {
   ColorValue value;
-  gboolean is_valid;
-} StaticColor;
+  gboolean is_valid = FALSE;
+};
 
-typedef struct
+/* *INDENT-OFF* */
+struct GstD3D11TestSrcRender
 {
   StaticColor static_color[2];
-  GstD3D11TestSrcQuad *quad[2];
+  std::vector < std::shared_ptr < GstD3D11TestSrcQuad >> quad;
+  ComPtr <ID3D11RasterizerState> rs;
   GstD3D11TestSrcPattern pattern;
-} GstD3D11TestSrcRender;
+};
+/* *INDENT-ON* */
 
 struct _GstD3D11TestSrc
 {
@@ -259,7 +264,7 @@ struct _GstD3D11TestSrc
   GstClockTime running_time;
 };
 
-typedef struct
+struct UvVertexData
 {
   struct
   {
@@ -272,9 +277,9 @@ typedef struct
     FLOAT u;
     FLOAT v;
   } texture;
-} UvVertexData;
+};
 
-typedef struct
+struct ColorVertexData
 {
   struct
   {
@@ -289,7 +294,7 @@ typedef struct
     FLOAT b;
     FLOAT a;
   } color;
-} ColorVertexData;
+};
 
 static gboolean
 setup_snow_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
@@ -297,22 +302,20 @@ setup_snow_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
 {
   HRESULT hr;
   D3D11_BUFFER_DESC buffer_desc;
-  D3D11_MAPPED_SUBRESOURCE map;
-  UvVertexData *vertex_data;
-  WORD *indices;
+  D3D11_SUBRESOURCE_DATA subresource;
+  UvVertexData vertex_data[4];
+  const WORD indices[6] = { 0, 1, 2, 3, 0, 2 };
   ID3D11Device *device_handle =
       gst_d3d11_device_get_device_handle (self->device);
-  ID3D11DeviceContext *context_handle =
-      gst_d3d11_device_get_device_context_handle (self->device);
   ComPtr < ID3D11PixelShader > ps;
   ComPtr < ID3D11VertexShader > vs;
   ComPtr < ID3D11InputLayout > layout;
   ComPtr < ID3D11Buffer > vertex_buffer;
   ComPtr < ID3D11Buffer > index_buffer;
   ComPtr < ID3D11Buffer > const_buffer;
-  GstD3D11TestSrcQuad *quad;
 
   memset (&buffer_desc, 0, sizeof (buffer_desc));
+  memset (&subresource, 0, sizeof (subresource));
 
   hr = gst_d3d11_get_vertex_shader_coord (self->device, &vs, &layout);
   if (!gst_d3d11_result (hr, self->device)) {
@@ -325,56 +328,6 @@ setup_snow_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
     GST_ERROR_OBJECT (self, "Failed to compile pixel shader");
     return FALSE;
   }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (UvVertexData) * 4;
-  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &vertex_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
-    return FALSE;
-  }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (WORD) * 6;
-  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &index_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create index buffer");
-    return FALSE;
-  }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (SnowConstBuffer);
-  buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &const_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create constant buffer");
-    return FALSE;
-  }
-
-  GstD3D11DeviceLockGuard lk (self->device);
-  hr = context_handle->Map (vertex_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map vertex buffer");
-    return FALSE;
-  }
-  vertex_data = (UvVertexData *) map.pData;
-
-  hr = context_handle->Map (index_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map index buffer");
-    context_handle->Unmap (vertex_buffer.Get (), 0);
-    return FALSE;
-  }
-  indices = (WORD *) map.pData;
 
   if (on_smpte) {
     FLOAT left, right, top, bottom;
@@ -446,35 +399,59 @@ setup_snow_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
     vertex_data[3].texture.v = 1.0f;
   }
 
-  /* clockwise indexing */
-  indices[0] = 0;               /* bottom left */
-  indices[1] = 1;               /* top left */
-  indices[2] = 2;               /* top right */
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (UvVertexData) * 4;
+  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-  indices[3] = 3;               /* bottom right */
-  indices[4] = 0;               /* bottom left  */
-  indices[5] = 2;               /* top right */
+  subresource.pSysMem = vertex_data;
+  subresource.SysMemPitch = sizeof (UvVertexData) * 4;
 
-  context_handle->Unmap (vertex_buffer.Get (), 0);
-  context_handle->Unmap (index_buffer.Get (), 0);
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &vertex_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
+    return FALSE;
+  }
 
-  quad = g_new0 (GstD3D11TestSrcQuad, 1);
-  if (on_smpte)
-    render->quad[1] = quad;
-  else
-    render->quad[0] = quad;
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (WORD) * 6;
+  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-  quad->ps = ps.Detach ();
-  quad->vs = vs.Detach ();
-  quad->layout = layout.Detach ();
-  quad->vertex_buffer = vertex_buffer.Detach ();
-  quad->index_buffer = index_buffer.Detach ();
-  quad->const_buffer = const_buffer.Detach ();
+  subresource.pSysMem = indices;
+  subresource.SysMemPitch = sizeof (WORD) * 6;
+
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &index_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create index buffer");
+    return FALSE;
+  }
+
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (SnowConstBuffer);
+  buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &const_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create constant buffer");
+    return FALSE;
+  }
+
+  auto quad = std::make_shared < GstD3D11TestSrcQuad > ();
+
+  quad->ps = ps;
+  quad->vs = vs;
+  quad->layout = layout;
+  quad->vertex_buffer = vertex_buffer;
+  quad->index_buffer = index_buffer;
+  quad->const_buffer = const_buffer;
   quad->vertex_stride = sizeof (UvVertexData);
   quad->index_count = 6;
   quad->is_snow = TRUE;
   quad->snow_const_buffer.time = 0;
   quad->snow_const_buffer.alpha = self->alpha;
+
+  render->quad.push_back (quad);
 
   return TRUE;
 }
@@ -484,23 +461,21 @@ setup_smpte_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render)
 {
   HRESULT hr;
   D3D11_BUFFER_DESC buffer_desc;
-  D3D11_MAPPED_SUBRESOURCE map;
-  ColorVertexData *vertex_data;
-  WORD *indices;
+  D3D11_SUBRESOURCE_DATA subresource;
+  ColorVertexData vertex_data[4 * 20];
+  WORD indices[6 * 20];
   ID3D11Device *device_handle =
       gst_d3d11_device_get_device_handle (self->device);
-  ID3D11DeviceContext *context_handle =
-      gst_d3d11_device_get_device_context_handle (self->device);
   ComPtr < ID3D11PixelShader > ps;
   ComPtr < ID3D11VertexShader > vs;
   ComPtr < ID3D11InputLayout > layout;
   ComPtr < ID3D11Buffer > vertex_buffer;
   ComPtr < ID3D11Buffer > index_buffer;
-  GstD3D11TestSrcQuad *quad;
   guint num_vertex = 0;
   guint num_index = 0;
 
   memset (&buffer_desc, 0, sizeof (buffer_desc));
+  memset (&subresource, 0, sizeof (subresource));
 
   hr = gst_d3d11_get_vertex_shader_color (self->device, &vs, &layout);
   if (!gst_d3d11_result (hr, self->device)) {
@@ -513,46 +488,6 @@ setup_smpte_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render)
     GST_ERROR_OBJECT (self, "Failed to compile pixel shader");
     return FALSE;
   }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (ColorVertexData) * 4 * 20;
-  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &vertex_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
-    return FALSE;
-  }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (WORD) * 6 * 20;
-  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &index_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create index buffer");
-    return FALSE;
-  }
-
-  GstD3D11DeviceLockGuard lk (self->device);
-  hr = context_handle->Map (vertex_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map vertex buffer");
-    return FALSE;
-  }
-  vertex_data = (ColorVertexData *) map.pData;
-
-  hr = context_handle->Map (index_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map index buffer");
-    context_handle->Unmap (vertex_buffer.Get (), 0);
-    return FALSE;
-  }
-  indices = (WORD *) map.pData;
 
   /* top row */
   for (guint i = 0; i < 7; i++) {
@@ -791,18 +726,45 @@ setup_smpte_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render)
     indices[idx_base + 5] = base + 2;   /* top right */
   }
 
-  context_handle->Unmap (vertex_buffer.Get (), 0);
-  context_handle->Unmap (index_buffer.Get (), 0);
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (ColorVertexData) * 4 * 20;
+  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-  render->quad[0] = quad = g_new0 (GstD3D11TestSrcQuad, 1);
+  subresource.pSysMem = vertex_data;
+  subresource.SysMemPitch = sizeof (ColorVertexData) * 4 * 20;
 
-  quad->ps = ps.Detach ();
-  quad->vs = vs.Detach ();
-  quad->layout = layout.Detach ();
-  quad->vertex_buffer = vertex_buffer.Detach ();
-  quad->index_buffer = index_buffer.Detach ();
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &vertex_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
+    return FALSE;
+  }
+
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (WORD) * 6 * 20;
+  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+  subresource.pSysMem = indices;
+  subresource.SysMemPitch = sizeof (WORD) * 6 * 20;
+
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &index_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create index buffer");
+    return FALSE;
+  }
+
+  auto quad = std::make_shared < GstD3D11TestSrcQuad > ();
+
+  quad->ps = ps;
+  quad->vs = vs;
+  quad->layout = layout;
+  quad->vertex_buffer = vertex_buffer;
+  quad->index_buffer = index_buffer;
   quad->vertex_stride = sizeof (ColorVertexData);
   quad->index_count = 6 * 20;
+
+  render->quad.push_back (quad);
 
   return setup_snow_render (self, render, TRUE);
 }
@@ -813,22 +775,20 @@ setup_checker_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
 {
   HRESULT hr;
   D3D11_BUFFER_DESC buffer_desc;
-  D3D11_MAPPED_SUBRESOURCE map;
-  UvVertexData *vertex_data;
-  WORD *indices;
+  D3D11_SUBRESOURCE_DATA subresource;
+  UvVertexData vertex_data[4];
+  const WORD indices[6] = { 0, 1, 2, 3, 0, 2 };
   ID3D11Device *device_handle =
       gst_d3d11_device_get_device_handle (self->device);
-  ID3D11DeviceContext *context_handle =
-      gst_d3d11_device_get_device_context_handle (self->device);
   ComPtr < ID3D11PixelShader > ps;
   ComPtr < ID3D11VertexShader > vs;
   ComPtr < ID3D11InputLayout > layout;
   ComPtr < ID3D11Buffer > vertex_buffer;
   ComPtr < ID3D11Buffer > index_buffer;
   ComPtr < ID3D11Buffer > const_buffer;
-  GstD3D11TestSrcQuad *quad;
 
   memset (&buffer_desc, 0, sizeof (buffer_desc));
+  memset (&subresource, 0, sizeof (subresource));
 
   hr = gst_d3d11_get_vertex_shader_coord (self->device, &vs, &layout);
   if (!gst_d3d11_result (hr, self->device)) {
@@ -841,56 +801,6 @@ setup_checker_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
     GST_ERROR_OBJECT (self, "Failed to compile pixel shader");
     return FALSE;
   }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (UvVertexData) * 4;
-  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &vertex_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
-    return FALSE;
-  }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (WORD) * 6;
-  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &index_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create index buffer");
-    return FALSE;
-  }
-
-  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-  buffer_desc.ByteWidth = sizeof (CheckerConstBuffer);
-  buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &const_buffer);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to create constant buffer");
-    return FALSE;
-  }
-
-  GstD3D11DeviceLockGuard lk (self->device);
-  hr = context_handle->Map (vertex_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map vertex buffer");
-    return FALSE;
-  }
-  vertex_data = (UvVertexData *) map.pData;
-
-  hr = context_handle->Map (index_buffer.Get (), 0, D3D11_MAP_WRITE_DISCARD, 0,
-      &map);
-  if (!gst_d3d11_result (hr, self->device)) {
-    GST_ERROR_OBJECT (self, "Failed to map index buffer");
-    context_handle->Unmap (vertex_buffer.Get (), 0);
-    return FALSE;
-  }
-  indices = (WORD *) map.pData;
 
   /* bottom left */
   vertex_data[0].position.x = -1.0f;
@@ -919,26 +829,52 @@ setup_checker_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
   vertex_data[3].texture.u = 1.0f;
   vertex_data[3].texture.v = 1.0f;
 
-  /* clockwise indexing */
-  indices[0] = 0;               /* bottom left */
-  indices[1] = 1;               /* top left */
-  indices[2] = 2;               /* top right */
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (UvVertexData) * 4;
+  buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-  indices[3] = 3;               /* bottom right */
-  indices[4] = 0;               /* bottom left  */
-  indices[5] = 2;               /* top right */
+  subresource.pSysMem = vertex_data;
+  subresource.SysMemPitch = sizeof (UvVertexData) * 4;
 
-  context_handle->Unmap (vertex_buffer.Get (), 0);
-  context_handle->Unmap (index_buffer.Get (), 0);
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &vertex_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create vertex buffer");
+    return FALSE;
+  }
 
-  render->quad[0] = quad = g_new0 (GstD3D11TestSrcQuad, 1);
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (WORD) * 6;
+  buffer_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-  quad->ps = ps.Detach ();
-  quad->vs = vs.Detach ();
-  quad->layout = layout.Detach ();
-  quad->vertex_buffer = vertex_buffer.Detach ();
-  quad->index_buffer = index_buffer.Detach ();
-  quad->const_buffer = const_buffer.Detach ();
+  subresource.pSysMem = indices;
+  subresource.SysMemPitch = sizeof (WORD) * 6;
+
+  hr = device_handle->CreateBuffer (&buffer_desc, &subresource, &index_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create index buffer");
+    return FALSE;
+  }
+
+  buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+  buffer_desc.ByteWidth = sizeof (CheckerConstBuffer);
+  buffer_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+  buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  hr = device_handle->CreateBuffer (&buffer_desc, nullptr, &const_buffer);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Failed to create constant buffer");
+    return FALSE;
+  }
+
+  auto quad = std::make_shared < GstD3D11TestSrcQuad > ();
+
+  quad->ps = ps;
+  quad->vs = vs;
+  quad->layout = layout;
+  quad->vertex_buffer = vertex_buffer;
+  quad->index_buffer = index_buffer;
+  quad->const_buffer = const_buffer;
   quad->vertex_stride = sizeof (UvVertexData);
   quad->index_count = 6;
   quad->is_checker = TRUE;
@@ -946,6 +882,8 @@ setup_checker_render (GstD3D11TestSrc * self, GstD3D11TestSrcRender * render,
   quad->checker_const_buffer.height = self->info.height;
   quad->checker_const_buffer.checker_size = checker_size;
   quad->checker_const_buffer.alpha = self->alpha;
+
+  render->quad.push_back (quad);
 
   return TRUE;
 }
@@ -1244,34 +1182,6 @@ gst_d3d11_test_src_fixate (GstBaseSrc * bsrc, GstCaps * caps)
 }
 
 static void
-gst_d3d11_test_src_quad_free (GstD3D11TestSrcQuad * quad)
-{
-  if (!quad)
-    return;
-
-  GST_D3D11_CLEAR_COM (quad->ps);
-  GST_D3D11_CLEAR_COM (quad->vs);
-  GST_D3D11_CLEAR_COM (quad->layout);
-  GST_D3D11_CLEAR_COM (quad->vertex_buffer);
-  GST_D3D11_CLEAR_COM (quad->index_buffer);
-  GST_D3D11_CLEAR_COM (quad->const_buffer);
-
-  g_free (quad);
-}
-
-static void
-gst_d3d11_test_src_render_free (GstD3D11TestSrcRender * render)
-{
-  if (!render)
-    return;
-
-  for (guint i = 0; i < G_N_ELEMENTS (render->quad); i++)
-    g_clear_pointer (&render->quad[i], gst_d3d11_test_src_quad_free);
-
-  g_free (render);
-}
-
-static void
 gst_d3d11_test_src_clear_resource (GstD3D11TestSrc * self)
 {
   if (self->render_pool) {
@@ -1284,7 +1194,11 @@ gst_d3d11_test_src_clear_resource (GstD3D11TestSrc * self)
     gst_clear_object (&self->convert_pool);
   }
 
-  g_clear_pointer (&self->render, gst_d3d11_test_src_render_free);
+  if (self->render) {
+    delete self->render;
+    self->render = nullptr;
+  }
+
   gst_clear_object (&self->converter);
 }
 
@@ -1296,10 +1210,23 @@ gst_d3d11_test_src_setup_resource (GstD3D11TestSrc * self, GstCaps * caps)
   GstD3D11AllocationParams *params;
   GstD3D11TestSrcRender *render;
   GstStructure *config;
+  HRESULT hr;
+  GstD3D11Format device_format;
+  guint bind_flags = 0;
 
   config = gst_structure_new ("converter-config",
       GST_D3D11_CONVERTER_OPT_BACKEND, GST_TYPE_D3D11_CONVERTER_BACKEND,
-      GST_D3D11_CONVERTER_BACKEND_SHADER, nullptr);
+      GST_D3D11_CONVERTER_BACKEND_SHADER,
+      GST_D3D11_CONVERTER_OPT_DEST_ALPHA_MODE,
+      GST_TYPE_D3D11_CONVERTER_ALPHA_MODE, self->alpha_mode, nullptr);
+
+  /* D2D uses premultiplied alpha */
+  if (self->pattern == GST_D3D11_TEST_SRC_CIRCULAR ||
+      self->pattern == GST_D3D11_TEST_SRC_BALL) {
+    gst_structure_set (config, GST_D3D11_CONVERTER_OPT_SRC_ALPHA_MODE,
+        GST_TYPE_D3D11_CONVERTER_ALPHA_MODE,
+        GST_D3D11_CONVERTER_ALPHA_MODE_PREMULTIPLIED, nullptr);
+  }
 
   gst_video_info_set_format (&draw_info, GST_VIDEO_FORMAT_BGRA,
       self->info.width, self->info.height);
@@ -1310,15 +1237,6 @@ gst_d3d11_test_src_setup_resource (GstD3D11TestSrc * self, GstCaps * caps)
     GST_ERROR_OBJECT (self, "Failed to create converter");
     goto error;
   }
-
-  /* D2D uses premultiplied alpha */
-  if (self->pattern == GST_D3D11_TEST_SRC_CIRCULAR ||
-      self->pattern == GST_D3D11_TEST_SRC_BALL) {
-    g_object_set (self->converter, "src-alpha-mode",
-        GST_D3D11_CONVERTER_ALPHA_MODE_PREMULTIPLIED, nullptr);
-  }
-
-  g_object_set (self->converter, "dest-alpha-mode", self->alpha_mode, nullptr);
 
   draw_caps = gst_video_info_to_caps (&draw_info);
   params = gst_d3d11_allocation_params_new (self->device, &draw_info,
@@ -1337,8 +1255,19 @@ gst_d3d11_test_src_setup_resource (GstD3D11TestSrc * self, GstCaps * caps)
     goto error;
   }
 
+  gst_d3d11_device_get_format (self->device,
+      GST_VIDEO_INFO_FORMAT (&self->info), &device_format);
+
+  if ((device_format.format_support[0] &
+          D3D11_FORMAT_SUPPORT_RENDER_TARGET) != 0) {
+    bind_flags |= D3D11_BIND_RENDER_TARGET;
+  } else if ((device_format.format_support[0] &
+          D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0) {
+    bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
+  }
+
   params = gst_d3d11_allocation_params_new (self->device, &self->info,
-      GST_D3D11_ALLOCATION_FLAG_DEFAULT, D3D11_BIND_RENDER_TARGET, 0);
+      GST_D3D11_ALLOCATION_FLAG_DEFAULT, bind_flags, 0);
   self->convert_pool = gst_d3d11_buffer_pool_new_with_options (self->device,
       caps, params, 0, 0);
   gst_d3d11_allocation_params_free (params);
@@ -1356,8 +1285,14 @@ gst_d3d11_test_src_setup_resource (GstD3D11TestSrc * self, GstCaps * caps)
   self->viewport.MinDepth = 0.0f;
   self->viewport.MaxDepth = 1.0f;
 
-  self->render = render = g_new0 (GstD3D11TestSrcRender, 1);
+  self->render = render = new GstD3D11TestSrcRender ();
   render->pattern = self->pattern;
+
+  hr = gst_d3d11_device_get_rasterizer (self->device, &render->rs);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Couldn't get rasterizer state");
+    goto error;
+  }
 
   switch (self->pattern) {
     case GST_D3D11_TEST_SRC_SMPTE:
@@ -1517,13 +1452,31 @@ gst_d3d11_test_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
   gst_buffer_pool_config_add_option (config, GST_BUFFER_POOL_OPTION_VIDEO_META);
 
   if (self->downstream_supports_d3d11) {
+    GstD3D11Format device_format;
+    guint bind_flags = 0;
+
+    gst_d3d11_device_get_format (self->device, GST_VIDEO_INFO_FORMAT (&vinfo),
+        &device_format);
+
+    if ((device_format.format_support[0] &
+            D3D11_FORMAT_SUPPORT_RENDER_TARGET) != 0) {
+      bind_flags |= D3D11_BIND_RENDER_TARGET;
+    }
+
+    if ((device_format.format_support[0] &
+            D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) != 0) {
+      bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
+    }
+
+    if ((device_format.format_support[0] & D3D11_BIND_SHADER_RESOURCE) != 0)
+      bind_flags |= D3D11_BIND_SHADER_RESOURCE;
+
     d3d11_params = gst_buffer_pool_config_get_d3d11_allocation_params (config);
     if (!d3d11_params) {
       d3d11_params = gst_d3d11_allocation_params_new (self->device, &vinfo,
-          GST_D3D11_ALLOCATION_FLAG_DEFAULT,
-          D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0);
+          GST_D3D11_ALLOCATION_FLAG_DEFAULT, bind_flags, 0);
     } else {
-      d3d11_params->desc[0].BindFlags |= D3D11_BIND_RENDER_TARGET;
+      gst_d3d11_allocation_params_set_bind_flags (d3d11_params, bind_flags);
     }
 
     gst_buffer_pool_config_set_d3d11_allocation_params (config, d3d11_params);
@@ -1894,18 +1847,15 @@ gst_d3d11_test_src_draw_pattern (GstD3D11TestSrc * self,
 
   context->IASetPrimitiveTopology (D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   context->RSSetViewports (1, &self->viewport);
+  context->RSSetState (render->rs.Get ());
   context->OMSetRenderTargets (1, &rtv, nullptr);
   context->OMSetBlendState (nullptr, nullptr, 0xffffffff);
 
-  for (guint i = 0; i < G_N_ELEMENTS (render->quad); i++) {
-    GstD3D11TestSrcQuad *quad = render->quad[i];
-
-    if (!quad)
-      break;
-
+  /* *INDENT-OFF* */
+  for (auto quad : render->quad) {
     if (quad->const_buffer) {
-      hr = context->Map (quad->const_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
-          &map);
+      hr = context->Map (quad->const_buffer.Get (),
+          0, D3D11_MAP_WRITE_DISCARD, 0, &map);
       if (!gst_d3d11_result (hr, self->device)) {
         GST_ERROR_OBJECT (self, "Failed to map constant buffer");
         return FALSE;
@@ -1922,23 +1872,27 @@ gst_d3d11_test_src_draw_pattern (GstD3D11TestSrc * self,
             sizeof (CheckerConstBuffer));
       }
 
-      context->Unmap (quad->const_buffer, 0);
+      context->Unmap (quad->const_buffer.Get (), 0);
 
-      context->PSSetConstantBuffers (0, 1, &quad->const_buffer);
+      ID3D11Buffer *const_bufs[] = { quad->const_buffer.Get () };
+      context->PSSetConstantBuffers (0, 1, const_bufs);
     } else {
       context->PSSetConstantBuffers (0, 0, nullptr);
     }
 
-    context->IASetInputLayout (quad->layout);
-    context->IASetVertexBuffers (0, 1, &quad->vertex_buffer,
+    context->IASetInputLayout (quad->layout.Get ());
+    ID3D11Buffer *vertex_buf[] = { quad->vertex_buffer.Get () };
+    context->IASetVertexBuffers (0, 1, vertex_buf,
         &quad->vertex_stride, &offsets);
-    context->IASetIndexBuffer (quad->index_buffer, DXGI_FORMAT_R16_UINT, 0);
+    context->IASetIndexBuffer (quad->index_buffer.Get (), DXGI_FORMAT_R16_UINT,
+        0);
 
-    context->VSSetShader (quad->vs, nullptr, 0);
-    context->PSSetShader (quad->ps, nullptr, 0);
+    context->VSSetShader (quad->vs.Get (), nullptr, 0);
+    context->PSSetShader (quad->ps.Get (), nullptr, 0);
 
     context->DrawIndexed (quad->index_count, 0, 0);
   }
+  /* *INDENT-ON* */
 
   context->OMSetRenderTargets (0, nullptr, nullptr);
 

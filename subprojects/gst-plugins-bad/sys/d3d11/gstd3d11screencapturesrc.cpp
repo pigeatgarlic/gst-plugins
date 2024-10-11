@@ -163,8 +163,10 @@ gst_d3d11_window_capture_mode_get_type (void)
 
 static GstStaticCaps template_caps =
     GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-    (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, "BGRA") ", pixel-aspect-ratio = 1/1;"
-    GST_VIDEO_CAPS_MAKE ("BGRA") ", pixel-aspect-ratio = 1/1");
+    (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY,
+        "BGRA") ", pixel-aspect-ratio = 1/1, colorimetry = (string) sRGB; "
+    GST_VIDEO_CAPS_MAKE ("BGRA") ", pixel-aspect-ratio = 1/1, "
+    "colorimetry = (string) sRGB");
 
 struct _GstD3D11ScreenCaptureSrc
 {
@@ -201,11 +203,7 @@ struct _GstD3D11ScreenCaptureSrc
 
   gboolean downstream_supports_d3d11;
 
-  ID3D11VertexShader *vs;
-  ID3D11PixelShader *ps;
-  ID3D11InputLayout *layout;
-  ID3D11SamplerState *sampler;
-  ID3D11BlendState *blend;
+  ShaderResource resource;
 
   CRITICAL_SECTION lock;
 };
@@ -634,7 +632,6 @@ gst_d3d11_screen_capture_src_get_caps (GstBaseSrc * bsrc, GstCaps * filter)
   GstD3D11ScreenCaptureSrc *self = GST_D3D11_SCREEN_CAPTURE_SRC (bsrc);
   GstCaps *caps = NULL;
   guint width, height;
-  GstVideoColorimetry color;
 
   if (!self->capture) {
     GST_DEBUG_OBJECT (self, "capture object is not configured yet");
@@ -650,16 +647,6 @@ gst_d3d11_screen_capture_src_get_caps (GstBaseSrc * bsrc, GstCaps * filter)
 
   gst_caps_set_simple (caps, "width", G_TYPE_INT, width, "height",
       G_TYPE_INT, height, nullptr);
-
-  if (gst_d3d11_screen_capture_get_colorimetry (self->capture, &color)) {
-    gchar *color_str = gst_video_colorimetry_to_string (&color);
-
-    if (color_str) {
-      gst_caps_set_simple (caps, "colorimetry", G_TYPE_STRING, color_str,
-          nullptr);
-      g_free (color_str);
-    }
-  }
 
   if (filter) {
     GstCaps *tmp =
@@ -698,8 +685,8 @@ gst_d3d11_screen_capture_src_fixate (GstBaseSrc * bsrc, GstCaps * caps)
         gst_caps_append_structure (d3d11_caps, gst_structure_copy (s));
 
         gst_caps_set_features (d3d11_caps, 0,
-            gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY,
-                nullptr));
+            gst_caps_features_new_static_str
+            (GST_CAPS_FEATURE_MEMORY_D3D11_MEMORY, nullptr));
 
         break;
       }
@@ -802,7 +789,8 @@ gst_d3d11_screen_capture_src_decide_allocation (GstBaseSrc * bsrc,
           GST_D3D11_ALLOCATION_FLAG_DEFAULT,
           D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 0);
     } else {
-      d3d11_params->desc[0].BindFlags |= D3D11_BIND_RENDER_TARGET;
+      gst_d3d11_allocation_params_set_bind_flags (d3d11_params,
+          D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
     }
 
     gst_buffer_pool_config_set_d3d11_allocation_params (config, d3d11_params);
@@ -834,7 +822,8 @@ gst_d3d11_screen_capture_src_decide_allocation (GstBaseSrc * bsrc,
       d3d11_params = gst_d3d11_allocation_params_new (self->device, &vinfo,
           GST_D3D11_ALLOCATION_FLAG_DEFAULT, D3D11_BIND_RENDER_TARGET, 0);
     } else {
-      d3d11_params->desc[0].BindFlags |= D3D11_BIND_RENDER_TARGET;
+      gst_d3d11_allocation_params_set_bind_flags (d3d11_params,
+          D3D11_BIND_RENDER_TARGET);
     }
 
     gst_buffer_pool_config_set_d3d11_allocation_params (config, d3d11_params);
@@ -875,10 +864,11 @@ gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
   ComPtr < ID3D11PixelShader > ps;
   ComPtr < ID3D11SamplerState > sampler;
   ComPtr < ID3D11BlendState > blend;
-  D3D11_SAMPLER_DESC sampler_desc;
+  ComPtr < ID3D11RasterizerState > rs;
   D3D11_BLEND_DESC blend_desc;
   ID3D11Device *device_handle;
   HRESULT hr;
+  ShaderResource *resource = &self->resource;
 
   device_handle = gst_d3d11_device_get_device_handle (self->device);
 
@@ -894,16 +884,8 @@ gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
     return FALSE;
   }
 
-  memset (&sampler_desc, 0, sizeof (D3D11_SAMPLER_DESC));
-  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-  sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-  sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-  sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-  sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-  sampler_desc.MinLOD = 0;
-  sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
-
-  hr = device_handle->CreateSamplerState (&sampler_desc, &sampler);
+  hr = gst_d3d11_device_get_sampler (self->device,
+      D3D11_FILTER_MIN_MAG_MIP_LINEAR, &sampler);
   if (!gst_d3d11_result (hr, self->device)) {
     GST_ERROR_OBJECT (self,
         "Failed to create sampler state, hr 0x%x", (guint) hr);
@@ -916,8 +898,8 @@ gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
   blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
   blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
   blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-  blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-  blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+  blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+  blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
   blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
   blend_desc.RenderTarget[0].RenderTargetWriteMask =
       D3D11_COLOR_WRITE_ENABLE_ALL;
@@ -929,11 +911,18 @@ gst_d3d11_screen_capture_prepare_shader (GstD3D11ScreenCaptureSrc * self)
     return FALSE;
   }
 
-  self->vs = vs.Detach ();
-  self->ps = ps.Detach ();
-  self->layout = layout.Detach ();
-  self->sampler = sampler.Detach ();
-  self->blend = blend.Detach ();
+  hr = gst_d3d11_device_get_rasterizer (self->device, &rs);
+  if (!gst_d3d11_result (hr, self->device)) {
+    GST_ERROR_OBJECT (self, "Couldn't get rasterizer state");
+    return FALSE;
+  }
+
+  resource->vs = vs.Detach ();
+  resource->ps = ps.Detach ();
+  resource->layout = layout.Detach ();
+  resource->sampler = sampler.Detach ();
+  resource->blend = blend.Detach ();
+  resource->rs = rs.Detach ();
 
   return TRUE;
 }
@@ -1088,6 +1077,7 @@ static gboolean
 gst_d3d11_screen_capture_src_stop (GstBaseSrc * bsrc)
 {
   GstD3D11ScreenCaptureSrc *self = GST_D3D11_SCREEN_CAPTURE_SRC (bsrc);
+  ShaderResource *resource = &self->resource;
   GstD3D11CSLockGuard lk (&self->lock);
 
   if (self->pool) {
@@ -1095,11 +1085,12 @@ gst_d3d11_screen_capture_src_stop (GstBaseSrc * bsrc)
     gst_clear_object (&self->pool);
   }
 
-  GST_D3D11_CLEAR_COM (self->vs);
-  GST_D3D11_CLEAR_COM (self->ps);
-  GST_D3D11_CLEAR_COM (self->layout);
-  GST_D3D11_CLEAR_COM (self->sampler);
-  GST_D3D11_CLEAR_COM (self->blend);
+  GST_D3D11_CLEAR_COM (resource->vs);
+  GST_D3D11_CLEAR_COM (resource->ps);
+  GST_D3D11_CLEAR_COM (resource->layout);
+  GST_D3D11_CLEAR_COM (resource->sampler);
+  GST_D3D11_CLEAR_COM (resource->blend);
+  GST_D3D11_CLEAR_COM (resource->rs);
 
   gst_clear_object (&self->capture);
   gst_clear_object (&self->device);
@@ -1334,8 +1325,7 @@ again:
   texture = (ID3D11Texture2D *) info.data;
   before_capture = gst_clock_get_time (clock);
   ret = gst_d3d11_screen_capture_do_capture (self->capture, self->device,
-      texture, rtv, self->vs, self->ps, self->layout, self->sampler,
-      self->blend, &self->crop_box, draw_mouse);
+      texture, rtv, &self->resource, &self->crop_box, draw_mouse);
   gst_memory_unmap (mem, &info);
 
   switch (ret) {

@@ -73,7 +73,11 @@ struct _QtGLVideoItemPrivate
   GstCaps *new_caps;
   GstCaps *caps;
   GstVideoInfo new_v_info;
+  GstGLTextureTarget new_tex_target;
+
   GstVideoInfo v_info;
+  GstGLTextureTarget tex_target;
+  GstVideoRectangle v_rect;
 
   gboolean initted;
   GstGLDisplay *display;
@@ -304,7 +308,7 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
   if (texNode) {
     geometry = texNode->geometry();
     tex = static_cast<GstQSGMaterial *>(texNode->material());
-    if (tex && !tex->compatibleWith(&this->priv->v_info)) {
+    if (tex && !tex->compatibleWith(&this->priv->v_info, this->priv->tex_target)) {
       delete texNode;
       texNode = nullptr;
     }
@@ -314,8 +318,10 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
     texNode = new QSGGeometryNode();
     geometry = new QSGGeometry(QSGGeometry::defaultAttributes_TexturedPoint2D(), 4);
     texNode->setGeometry(geometry);
-    tex = GstQSGMaterial::new_for_format(GST_VIDEO_INFO_FORMAT (&this->priv->v_info));
+    texNode->setFlag(QSGGeometryNode::Flag::OwnsGeometry);
+    tex = GstQSGMaterial::new_for_format_and_target (GST_VIDEO_INFO_FORMAT (&this->priv->v_info), this->priv->tex_target);
     texNode->setMaterial(tex);
+    texNode->setFlag(QSGGeometryNode::Flag::OwnsMaterial);
   }
 
   if ((old_buffer = tex->getBuffer(&was_bound))) {
@@ -373,6 +379,11 @@ QtGLVideoItem::updatePaintNode(QSGNode * oldNode,
   QRectF rect(result.x, result.y, result.w, result.h);
   QRectF sourceRect(0, 0, 1, 1);
   QSGGeometry::updateTexturedRectGeometry(geometry, rect, sourceRect);
+  if(priv->v_rect.x != result.x || priv->v_rect.y != result.y ||
+     priv->v_rect.w != result.w || priv->v_rect.h != result.h) {
+    texNode->markDirty(QSGNode::DirtyGeometry);
+    priv->v_rect = result;
+  }
 
   g_mutex_unlock (&this->priv->lock);
 
@@ -681,6 +692,7 @@ QtGLVideoItemInterface::setBuffer (GstBuffer * buffer)
     gst_caps_take (&qt_item->priv->caps, qt_item->priv->new_caps);
     qt_item->priv->new_caps = NULL;
     qt_item->priv->v_info = qt_item->priv->new_v_info;
+    qt_item->priv->tex_target = qt_item->priv->new_tex_target;
 
     if (!_calculate_par (qt_item, &qt_item->priv->v_info)) {
       g_mutex_unlock (&qt_item->priv->lock);
@@ -728,7 +740,7 @@ QtGLVideoItem::onSceneGraphInvalidated ()
   GST_FIXME ("%p scene graph invalidated", this);
 }
 
-/**
+/*
  * Retrieve and populate the GL context information from the current
  * OpenGL context.
  */
@@ -821,6 +833,9 @@ QtGLVideoItemInterface::setCaps (GstCaps * caps)
   if (!gst_video_info_from_caps (&v_info, caps))
     return FALSE;
 
+  GstStructure *s = gst_caps_get_structure (caps, 0);
+  const gchar *target_str = gst_structure_get_string (s, "texture-target");
+
   g_mutex_lock (&qt_item->priv->lock);
 
   GST_DEBUG ("%p set caps %" GST_PTR_FORMAT, qt_item, caps);
@@ -828,6 +843,11 @@ QtGLVideoItemInterface::setCaps (GstCaps * caps)
   gst_caps_replace (&qt_item->priv->new_caps, caps);
 
   qt_item->priv->new_v_info = v_info;
+  if (target_str) {
+    qt_item->priv->new_tex_target = gst_gl_texture_target_from_string(target_str);
+  } else {
+    qt_item->priv->new_tex_target = GST_GL_TEXTURE_TARGET_2D;
+  }
 
   g_mutex_unlock (&qt_item->priv->lock);
 

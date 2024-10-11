@@ -22,8 +22,7 @@
 #endif
 
 #include "gstd3d12download.h"
-#include "gstd3d12bufferpool.h"
-#include "gstd3d12format.h"
+#include "gstd3d12pluginutils.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_d3d12_download_debug);
 #define GST_CAT_DEFAULT gst_d3d12_download_debug
@@ -116,7 +115,7 @@ _set_caps_features (const GstCaps * caps, const gchar * feature_name)
 
   for (i = 0; i < n; i++) {
     gst_caps_set_features (tmp, i,
-        gst_caps_features_from_string (feature_name));
+        gst_caps_features_new_single_static_str (feature_name));
   }
 
   return tmp;

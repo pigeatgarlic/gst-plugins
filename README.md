@@ -12,17 +12,17 @@ Our documentation, including tutorials, API reference and FAQ can be found at
 
   https://gstreamer.freedesktop.org/documentation/
 
-You can subscribe to our mailing lists:
+You can ask questions on the GStreamer Discourse at
 
-  https://lists.freedesktop.org/mailman/listinfo/gstreamer-announce
-
-  https://lists.freedesktop.org/mailman/listinfo/gstreamer-devel
+  https://discourse.gstreamer.org/
 
 We track bugs, feature requests and merge requests (patches) in GitLab at
 
   https://gitlab.freedesktop.org/gstreamer/
 
-You can join us on IRC - #gstreamer on irc.oftc.net
+You can join us on our Matrix room at
+
+  https://matrix.to/#/#gstreamer:gstreamer.org
 
 This repository contains all official modules supported by the GStreamer
 community which can be found in the `subprojects/` directory.
@@ -39,7 +39,7 @@ You can find [instructions for Windows below](#windows-prerequisites-setup).
 
 ### Install meson and ninja
 
-Meson 0.62 or newer is required.
+Meson 1.1 or newer is required.
 
 On Linux and macOS you can get meson through your package manager or using:
 
@@ -187,7 +187,7 @@ ABI can be set using `gst-full-libraries` option.
 glib-2.0, gobject-2.0 and gstreamer-1.0 are always included.
 
 ```
-meson --default-library=static -Dgst-full-libraries=app,video builddir
+meson setup --default-library=static -Dgst-full-libraries=gstreamer-app-1.0,gstreamer-video-1.0 builddir
 ```
 
 GStreamer *1.18* requires applications using gstreamer-full-1.0 to initialize
@@ -253,6 +253,11 @@ made in the future.
 Only linux-like platforms are currently well supported when Windows, MSVC
 and MinGW, should be considered as *experimental* as the symbols export
 is still under discussion.
+
+Since 1.24.7, it is possible to disable the `gstreamer-full` library by passing
+`-Dgst-full=disabled`. This can be useful in cases where you want a static
+build of gstreamer, but you do not want to use gst-full, since linking the
+static executables associated with it can be quite CPU/RAM intensive.
 
 
 #### Full-static build

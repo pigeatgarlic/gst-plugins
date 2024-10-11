@@ -39,39 +39,32 @@ static gboolean
 _try_import_dmabuf_unlocked (GstVaBufferImporter * importer, GstBuffer * inbuf)
 {
   GstVideoMeta *meta;
-  GstVideoInfo in_info = *importer->in_info;
+  GstVideoInfoDmaDrm drm_info = *importer->in_drm_info;
   GstMemory *mems[GST_VIDEO_MAX_PLANES];
-  guint i, n_mem, n_planes, usage_hint;
+  guint i, n_planes, usage_hint;
   gsize offset[GST_VIDEO_MAX_PLANES];
   uintptr_t fd[GST_VIDEO_MAX_PLANES];
-  gsize plane_size[GST_VIDEO_MAX_PLANES];
-  GstVideoAlignment align = { 0, };
-
-  n_planes = GST_VIDEO_INFO_N_PLANES (&in_info);
-  n_mem = gst_buffer_n_memory (inbuf);
-  meta = gst_buffer_get_video_meta (inbuf);
 
   /* This will eliminate most non-dmabuf out there */
   if (!gst_is_dmabuf_memory (gst_buffer_peek_memory (inbuf, 0)))
     return FALSE;
 
-  /* We cannot have multiple dmabuf per plane */
-  if (n_mem > n_planes)
-    return FALSE;
+  n_planes = GST_VIDEO_INFO_N_PLANES (&drm_info.vinfo);
+
+  meta = gst_buffer_get_video_meta (inbuf);
 
   /* Update video info importerd on video meta */
   if (meta) {
-    GST_VIDEO_INFO_WIDTH (&in_info) = meta->width;
-    GST_VIDEO_INFO_HEIGHT (&in_info) = meta->height;
+    GST_VIDEO_INFO_WIDTH (&drm_info.vinfo) = meta->width;
+    GST_VIDEO_INFO_HEIGHT (&drm_info.vinfo) = meta->height;
 
-    for (i = 0; i < meta->n_planes; i++) {
-      GST_VIDEO_INFO_PLANE_OFFSET (&in_info, i) = meta->offset[i];
-      GST_VIDEO_INFO_PLANE_STRIDE (&in_info, i) = meta->stride[i];
+    g_assert (n_planes == meta->n_planes);
+
+    for (i = 0; i < n_planes; i++) {
+      GST_VIDEO_INFO_PLANE_OFFSET (&drm_info.vinfo, i) = meta->offset[i];
+      GST_VIDEO_INFO_PLANE_STRIDE (&drm_info.vinfo, i) = meta->stride[i];
     }
   }
-
-  if (!gst_video_info_align_full (&in_info, &align, plane_size))
-    return FALSE;
 
   /* Find and validate all memories */
   for (i = 0; i < n_planes; i++) {
@@ -80,7 +73,7 @@ _try_import_dmabuf_unlocked (GstVaBufferImporter * importer, GstBuffer * inbuf)
     gsize mem_skip;
 
     if (!gst_buffer_find_memory (inbuf,
-            GST_VIDEO_INFO_PLANE_OFFSET (&in_info, i), plane_size[i], &mem_idx,
+            GST_VIDEO_INFO_PLANE_OFFSET (&drm_info.vinfo, i), 1, &mem_idx,
             &length, &mem_skip))
       return FALSE;
 
@@ -102,8 +95,8 @@ _try_import_dmabuf_unlocked (GstVaBufferImporter * importer, GstBuffer * inbuf)
       importer->entrypoint, GST_PAD_SINK, TRUE);
 
   /* Now create a VASurfaceID for the buffer */
-  return gst_va_dmabuf_memories_setup (importer->display, &in_info, n_planes,
-      mems, fd, offset, usage_hint);
+  return gst_va_dmabuf_memories_setup (importer->display, &drm_info, mems, fd,
+      offset, usage_hint);
 }
 
 static gboolean
@@ -217,7 +210,7 @@ gst_va_base_convert_caps_to_va (GstCaps * caps)
   }
 
   gst_caps_set_features_simple (caps,
-      gst_caps_features_from_string (GST_CAPS_FEATURE_MEMORY_VA));
+      gst_caps_features_new_single_static_str (GST_CAPS_FEATURE_MEMORY_VA));
 
   return TRUE;
 }

@@ -91,6 +91,9 @@ if d3d11_winapi_app
   d3d11_sources += ['gstd3d11window_corewindow.cpp',
                     'gstd3d11window_swapchainpanel.cpp']
   extra_dep += [runtimeobject_lib]
+  if cc.get_id() == 'msvc' and get_option('b_sanitize') == 'address'
+    extra_args += ['/bigobj']
+  endif
 endif
 
 if d3d11_winapi_desktop
@@ -123,20 +126,13 @@ if cc.get_id() != 'msvc'
   extra_args += extra_mingw_args
 endif
 
-hlsl_precompiled = []
-fxc = find_program ('fxc', required : get_option ('d3d11-hlsl-precompile'))
-if cc.get_id() == 'msvc' and fxc.found()
-  subdir('hlsl')
-  extra_args += ['-DHLSL_PRECOMPILED']
-endif
-
 gstd3d11 = library('gstd3d11',
-  d3d11_sources + hlsl_precompiled,
+  d3d11_sources,
   c_args : gst_plugins_bad_args + extra_c_args + extra_args,
   cpp_args: gst_plugins_bad_args + extra_args,
   include_directories : [configinc],
   dependencies : [gstbase_dep, gstvideo_dep, gmodule_dep, gstcontroller_dep,
-                  gstd3d11_dep, gstdxva_dep, d2d_dep] + extra_dep,
+                  gstd3d11_dep, gstd3dshader_dep, gstdxva_dep, d2d_dep, directxmath_dep] + extra_dep,
   install : true,
   install_dir : plugins_install_dir,
 )

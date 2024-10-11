@@ -25,13 +25,7 @@
 #include <string.h>
 #include <vector>
 
-/* HACK: to expose dxva data structure on UWP */
-#ifdef WINAPI_PARTITION_DESKTOP
-#undef WINAPI_PARTITION_DESKTOP
-#endif
-#define WINAPI_PARTITION_DESKTOP 1
-#include <d3d9.h>
-#include <dxva.h>
+#include "gstdxvatypedef.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_dxva_mpeg2_decoder_debug);
 #define GST_CAT_DEFAULT gst_dxva_mpeg2_decoder_debug
@@ -45,6 +39,8 @@ struct _GstDxvaMpeg2DecoderPrivate
   std::vector<DXVA_SliceInfo> slice_list;
   std::vector<guint8> bitstream_buffer;
   GPtrArray *ref_pics = nullptr;
+
+  gboolean disable_postproc = FALSE;
 
   gboolean submit_iq_data;
 
@@ -340,6 +336,10 @@ gst_dxva_mpeg2_decoder_start_picture (GstMpeg2Decoder * decoder,
   pic_params->wForwardRefPictureIndex = 0xffff;
   pic_params->wBackwardRefPictureIndex = 0xffff;
 
+  /* d3d12 does not support post processing */
+  if (priv->disable_postproc)
+    pic_params->wDeblockedPictureIndex = 0xffff;
+
   switch (picture->type) {
     case GST_MPEG_VIDEO_PICTURE_TYPE_B:
     {
@@ -534,4 +534,12 @@ gst_dxva_mpeg2_decoder_output_picture (GstMpeg2Decoder * decoder,
 
   return klass->output_picture (self, frame, GST_CODEC_PICTURE (picture),
       picture->buffer_flags, priv->width, priv->height);
+}
+
+void
+gst_dxva_mpeg2_decoder_disable_postproc (GstDxvaMpeg2Decoder * decoder)
+{
+  g_return_if_fail (GST_IS_DXVA_MPEG2_DECODER (decoder));
+
+  decoder->priv->disable_postproc = TRUE;
 }

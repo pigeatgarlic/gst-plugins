@@ -80,7 +80,7 @@ static void gst_vtdec_finalize (GObject * object);
 
 static gboolean gst_vtdec_start (GstVideoDecoder * decoder);
 static gboolean gst_vtdec_stop (GstVideoDecoder * decoder);
-static void gst_vtdec_loop (GstVtdec * self);
+static void gst_vtdec_output_loop (GstVtdec * self);
 static gboolean gst_vtdec_negotiate (GstVideoDecoder * decoder);
 static gboolean gst_vtdec_set_format (GstVideoDecoder * decoder,
     GstVideoCodecState * state);
@@ -88,6 +88,8 @@ static gboolean gst_vtdec_flush (GstVideoDecoder * decoder);
 static GstFlowReturn gst_vtdec_finish (GstVideoDecoder * decoder);
 static gboolean gst_vtdec_sink_event (GstVideoDecoder * decoder,
     GstEvent * event);
+static GstStateChangeReturn gst_vtdec_change_state (GstElement * element,
+    GstStateChange transition);
 static GstFlowReturn gst_vtdec_handle_frame (GstVideoDecoder * decoder,
     GstVideoCodecFrame * frame);
 
@@ -188,6 +190,7 @@ gst_vtdec_class_init (GstVtdecClass * klass)
 
   gobject_class->finalize = gst_vtdec_finalize;
   element_class->set_context = gst_vtdec_set_context;
+  element_class->change_state = gst_vtdec_change_state;
   video_decoder_class->start = GST_DEBUG_FUNCPTR (gst_vtdec_start);
   video_decoder_class->stop = GST_DEBUG_FUNCPTR (gst_vtdec_stop);
   video_decoder_class->negotiate = GST_DEBUG_FUNCPTR (gst_vtdec_negotiate);
@@ -229,12 +232,12 @@ gst_vtdec_start (GstVideoDecoder * decoder)
   vtdec->is_flushing = FALSE;
   vtdec->is_draining = FALSE;
   vtdec->downstream_ret = GST_FLOW_OK;
-  vtdec->reorder_queue = gst_queue_array_new (0);
+  vtdec->reorder_queue = gst_vec_deque_new (0);
 
   /* Create the output task, but pause it immediately */
   vtdec->pause_task = TRUE;
   if (!gst_pad_start_task (GST_VIDEO_DECODER_SRC_PAD (decoder),
-          (GstTaskFunction) gst_vtdec_loop, vtdec, NULL)) {
+          (GstTaskFunction) gst_vtdec_output_loop, vtdec, NULL)) {
     GST_ERROR_OBJECT (vtdec, "failed to start output thread");
     return FALSE;
   }
@@ -254,13 +257,15 @@ gst_vtdec_stop (GstVideoDecoder * decoder)
   GstVideoCodecFrame *frame;
   GstVtdec *vtdec = GST_VTDEC (decoder);
 
+  GST_DEBUG_OBJECT (vtdec, "stop");
+
   gst_vtdec_drain_decoder (GST_VIDEO_DECODER_CAST (vtdec), TRUE);
   vtdec->downstream_ret = GST_FLOW_FLUSHING;
 
-  while ((frame = gst_queue_array_pop_head (vtdec->reorder_queue))) {
+  while ((frame = gst_vec_deque_pop_head (vtdec->reorder_queue))) {
     gst_video_decoder_release_frame (decoder, frame);
   }
-  gst_queue_array_free (vtdec->reorder_queue);
+  gst_vec_deque_free (vtdec->reorder_queue);
   vtdec->reorder_queue = NULL;
 
   gst_pad_stop_task (GST_VIDEO_DECODER_SRC_PAD (decoder));
@@ -289,13 +294,11 @@ gst_vtdec_stop (GstVideoDecoder * decoder)
   gst_clear_object (&vtdec->instance);
 #endif
 
-  GST_DEBUG_OBJECT (vtdec, "stop");
-
   return TRUE;
 }
 
 static void
-gst_vtdec_loop (GstVtdec * vtdec)
+gst_vtdec_output_loop (GstVtdec * vtdec)
 {
   GstVideoCodecFrame *frame;
   GstFlowReturn ret = GST_FLOW_OK;
@@ -303,7 +306,7 @@ gst_vtdec_loop (GstVtdec * vtdec)
   gboolean is_flushing;
 
   g_mutex_lock (&vtdec->queue_mutex);
-  while (gst_queue_array_is_empty (vtdec->reorder_queue)
+  while (gst_vec_deque_is_empty (vtdec->reorder_queue)
       && !vtdec->pause_task && !vtdec->is_flushing && !vtdec->is_draining) {
     g_cond_wait (&vtdec->queue_cond, &vtdec->queue_mutex);
   }
@@ -316,9 +319,9 @@ gst_vtdec_loop (GstVtdec * vtdec)
 
   /* push a buffer if there are enough frames to guarantee 
    * that we push in PTS order, or if we're draining/flushing */
-  while ((gst_queue_array_get_length (vtdec->reorder_queue) >=
+  while ((gst_vec_deque_get_length (vtdec->reorder_queue) >=
           vtdec->dbp_size) || vtdec->is_flushing || vtdec->is_draining) {
-    frame = gst_queue_array_pop_head (vtdec->reorder_queue);
+    frame = gst_vec_deque_pop_head (vtdec->reorder_queue);
     is_flushing = vtdec->is_flushing;
     g_cond_signal (&vtdec->queue_cond);
     g_mutex_unlock (&vtdec->queue_mutex);
@@ -329,10 +332,10 @@ gst_vtdec_loop (GstVtdec * vtdec)
       GST_VIDEO_DECODER_STREAM_LOCK (vtdec);
 
       if (frame->flags & VTDEC_FRAME_FLAG_ERROR) {
-        GST_LOG_OBJECT (vtdec, "ignoring frame %d because of error flag",
-            frame->system_frame_number);
+        GST_VIDEO_DECODER_ERROR (vtdec, 1, STREAM, DECODE,
+            ("Got frame %d with an error flag", frame->system_frame_number),
+            (NULL), ret);
         gst_video_decoder_release_frame (decoder, frame);
-        ret = GST_FLOW_ERROR;
       } else if (is_flushing || (frame->flags & VTDEC_FRAME_FLAG_SKIP)) {
         GST_LOG_OBJECT (vtdec, "flushing frame %d", frame->system_frame_number);
         gst_video_decoder_release_frame (decoder, frame);
@@ -340,6 +343,8 @@ gst_vtdec_loop (GstVtdec * vtdec)
         GST_LOG_OBJECT (vtdec, "dropping frame %d", frame->system_frame_number);
         gst_video_decoder_drop_frame (decoder, frame);
       } else {
+        GST_TRACE_OBJECT (vtdec, "pushing frame %d",
+            frame->system_frame_number);
         ret = gst_video_decoder_finish_frame (decoder, frame);
       }
 
@@ -360,7 +365,7 @@ gst_vtdec_loop (GstVtdec * vtdec)
   if (ret != GST_FLOW_OK) {
     g_mutex_lock (&vtdec->queue_mutex);
 
-    while ((frame = gst_queue_array_pop_head (vtdec->reorder_queue))) {
+    while ((frame = gst_vec_deque_pop_head (vtdec->reorder_queue))) {
       GST_LOG_OBJECT (vtdec, "flushing frame %d", frame->system_frame_number);
       gst_video_decoder_release_frame (decoder, frame);
     }
@@ -480,7 +485,22 @@ gst_vtdec_negotiate (GstVideoDecoder * decoder)
     gst_video_codec_state_unref (output_state);
   }
 
-  peercaps = gst_pad_peer_query_caps (GST_VIDEO_DECODER_SRC_PAD (vtdec), NULL);
+  templcaps =
+      gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SRC_PAD (decoder));
+  peercaps =
+      gst_pad_peer_query_caps (GST_VIDEO_DECODER_SRC_PAD (vtdec), templcaps);
+  gst_caps_unref (templcaps);
+
+  if (gst_caps_is_empty (peercaps)) {
+    GST_INFO_OBJECT (vtdec, "empty peer caps, can't negotiate");
+
+    gst_caps_unref (peercaps);
+    if (prevcaps)
+      gst_caps_unref (prevcaps);
+
+    return FALSE;
+  }
+
   if (prevcaps && gst_caps_can_intersect (prevcaps, peercaps)) {
     /* The hardware decoder can become (temporarily) unavailable across
      * VTDecompressionSessionCreate/Destroy calls. So if the currently configured
@@ -490,14 +510,10 @@ gst_vtdec_negotiate (GstVideoDecoder * decoder)
     GST_INFO_OBJECT (vtdec,
         "current and peer caps are compatible, keeping current caps");
     caps = gst_caps_ref (prevcaps);
+    gst_caps_unref (peercaps);
   } else {
-    templcaps =
-        gst_pad_get_pad_template_caps (GST_VIDEO_DECODER_SRC_PAD (decoder));
-    caps =
-        gst_caps_intersect_full (peercaps, templcaps, GST_CAPS_INTERSECT_FIRST);
-    gst_caps_unref (templcaps);
+    caps = peercaps;
   }
-  gst_caps_unref (peercaps);
 
   caps = gst_caps_truncate (gst_caps_make_writable (caps));
 
@@ -727,7 +743,7 @@ gst_vtdec_set_format (GstVideoDecoder * decoder, GstVideoCodecState * state)
     gst_video_codec_state_unref (vtdec->input_state);
   vtdec->input_state = gst_video_codec_state_ref (state);
 
-  return gst_video_decoder_negotiate (decoder);
+  return gst_vtdec_negotiate (decoder);
 }
 
 static gboolean
@@ -792,6 +808,20 @@ gst_vtdec_sink_event (GstVideoDecoder * decoder, GstEvent * event)
   return ret;
 }
 
+static GstStateChangeReturn
+gst_vtdec_change_state (GstElement * element, GstStateChange transition)
+{
+  GstVtdec *self = GST_VTDEC (element);
+
+  if (transition == GST_STATE_CHANGE_PAUSED_TO_READY) {
+    GST_DEBUG_OBJECT (self, "pausing output loop on PAUSED->READY");
+    gst_vtdec_pause_output_loop (self);
+  }
+
+  return GST_ELEMENT_CLASS (gst_vtdec_parent_class)->change_state (element,
+      transition);
+}
+
 static GstFlowReturn
 gst_vtdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
 {
@@ -812,7 +842,7 @@ gst_vtdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   /* Negotiate now so that we know whether we need to use the GL upload meta or not. 
    * gst_vtenc_negotiate() will drain before attempting to negotiate. */
   if (gst_pad_check_reconfigure (decoder->srcpad)) {
-    if (!gst_video_decoder_negotiate (decoder)) {
+    if (!gst_vtdec_negotiate (decoder)) {
       gst_pad_mark_reconfigure (decoder->srcpad);
       if (GST_PAD_IS_FLUSHING (decoder->srcpad))
         ret = GST_FLOW_FLUSHING;
@@ -826,13 +856,9 @@ gst_vtdec_handle_frame (GstVideoDecoder * decoder, GstVideoCodecFrame * frame)
   if (task_state == GST_TASK_STOPPED || task_state == GST_TASK_PAUSED) {
     /* Abort if our loop failed to push frames downstream... */
     if (vtdec->downstream_ret != GST_FLOW_OK) {
-      if (vtdec->downstream_ret == GST_FLOW_FLUSHING)
-        GST_DEBUG_OBJECT (vtdec,
-            "Output loop stopped because of flushing, ignoring frame");
-      else
-        GST_WARNING_OBJECT (vtdec,
-            "Output loop stopped with error (%s), leaving",
-            gst_flow_get_name (vtdec->downstream_ret));
+      GST_DEBUG_OBJECT (vtdec,
+          "Output loop stopped because of %s, ignoring frame",
+          gst_flow_get_name (vtdec->downstream_ret));
 
       ret = vtdec->downstream_ret;
       goto drop;
@@ -1181,6 +1207,7 @@ gst_vtdec_session_output_callback (void *decompression_output_ref_con,
   GstVtdec *vtdec = (GstVtdec *) decompression_output_ref_con;
   GstVideoCodecFrame *frame = (GstVideoCodecFrame *) source_frame_ref_con;
   GstVideoCodecState *state;
+  gboolean push_anyway = FALSE;
 
   GST_LOG_OBJECT (vtdec, "got output frame %p %d and VT buffer %p", frame,
       frame->decode_frame_number, image_buffer);
@@ -1188,8 +1215,30 @@ gst_vtdec_session_output_callback (void *decompression_output_ref_con,
   frame->output_buffer = NULL;
 
   if (status != noErr) {
-    GST_ERROR_OBJECT (vtdec, "Error decoding frame %d", (int) status);
-    frame->flags |= VTDEC_FRAME_FLAG_ERROR;
+    switch (status) {
+      case kVTVideoDecoderReferenceMissingErr:
+        /* ReferenceMissingErr is not critical, when it occurs the frame
+         * usually has the kVTDecodeInfo_FrameDropped flag set. Log only for debugging purposes. */
+        GST_DEBUG_OBJECT (vtdec, "ReferenceMissingErr when decoding frame %d",
+            frame->decode_frame_number);
+        break;
+#ifndef HAVE_IOS
+      case codecBadDataErr:    /* SW decoder on macOS uses a different code from the hardware one... */
+#endif
+      case kVTVideoDecoderBadDataErr:
+        /* BadDataErr also shouldn't cause an error to be displayed immediately.
+         * Set the error flag so the output loop will log a warning
+         * and only error out if this happens too many times. */
+        GST_DEBUG_OBJECT (vtdec, "BadDataErr when decoding frame %d",
+            frame->decode_frame_number);
+        frame->flags |= VTDEC_FRAME_FLAG_ERROR;
+        break;
+      default:
+        GST_ERROR_OBJECT (vtdec, "Error decoding frame %d: %d",
+            frame->decode_frame_number, (int) status);
+        frame->flags |= VTDEC_FRAME_FLAG_ERROR;
+        break;
+    }
   }
 
   if (image_buffer) {
@@ -1211,8 +1260,8 @@ gst_vtdec_session_output_callback (void *decompression_output_ref_con,
     }
   } else {
     if (info_flags & kVTDecodeInfo_FrameDropped) {
-      GST_DEBUG_OBJECT (vtdec, "Frame dropped by video toolbox %p %d",
-          frame, frame->decode_frame_number);
+      GST_DEBUG_OBJECT (vtdec, "Frame %d dropped by VideoToolbox (%p)",
+          frame->decode_frame_number, frame);
       frame->flags |= VTDEC_FRAME_FLAG_DROP;
     } else {
       GST_DEBUG_OBJECT (vtdec, "Decoded frame is NULL");
@@ -1224,15 +1273,22 @@ gst_vtdec_session_output_callback (void *decompression_output_ref_con,
    * to avoid processing too many frames ahead.
    * The DPB * 2 size limit is completely arbitrary. */
   g_mutex_lock (&vtdec->queue_mutex);
-  while (gst_queue_array_get_length (vtdec->reorder_queue) >
-      vtdec->dbp_size * 2) {
+  /* If negotiate() gets called from the output loop (via finish_frame()),
+   * it can attempt to drain and call VTDecompressionSessionWaitForAsynchronousFrames,
+   * which will lock up if we decide to wait in this callback, creating a deadlock. */
+  push_anyway = vtdec->is_flushing || vtdec->is_draining;
+  while (!push_anyway
+      && gst_vec_deque_get_length (vtdec->reorder_queue) >
+      vtdec->dbp_size * 2 + 1) {
     g_cond_wait (&vtdec->queue_cond, &vtdec->queue_mutex);
+    push_anyway = vtdec->is_flushing || vtdec->is_draining;
   }
 
-  gst_queue_array_push_sorted (vtdec->reorder_queue, frame, sort_frames_by_pts,
+  gst_vec_deque_push_sorted (vtdec->reorder_queue, frame, sort_frames_by_pts,
       NULL);
-  GST_LOG ("pushed frame %d, queue length %d", frame->decode_frame_number,
-      gst_queue_array_get_length (vtdec->reorder_queue));
+  GST_LOG ("pushed frame %d, queue length %" G_GSIZE_FORMAT,
+      frame->decode_frame_number,
+      gst_vec_deque_get_length (vtdec->reorder_queue));
   g_cond_signal (&vtdec->queue_cond);
   g_mutex_unlock (&vtdec->queue_mutex);
 }
@@ -1249,7 +1305,9 @@ gst_vtdec_drain_decoder (GstVideoDecoder * decoder, gboolean flush)
   if (vtdec->session == NULL)
     return GST_FLOW_OK;
 
-  if (vtdec->downstream_ret != GST_FLOW_OK
+  /* Only early-return here if we're draining (as that needs to output frames).
+   * Flushing doesn't care about errors from downstream. */
+  if (!flush && vtdec->downstream_ret != GST_FLOW_OK
       && vtdec->downstream_ret != GST_FLOW_FLUSHING) {
     GST_WARNING_OBJECT (vtdec, "Output loop stopped with error (%s), leaving",
         gst_flow_get_name (vtdec->downstream_ret));

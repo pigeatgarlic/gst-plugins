@@ -447,6 +447,7 @@ gst_srt_object_set_property_helper (GstSRTObject * srtobject,
       break;
     case PROP_AUTHENTICATION:
       srtobject->authentication = g_value_get_boolean (value);
+      break;
     case PROP_AUTO_RECONNECT:
       srtobject->auto_reconnect = g_value_get_boolean (value);
       break;
@@ -555,7 +556,10 @@ gst_srt_object_get_property_helper (GstSRTObject * srtobject,
       GST_OBJECT_UNLOCK (srtobject->element);
       break;
     case PROP_AUTHENTICATION:
+      GST_OBJECT_LOCK (srtobject->element);
       g_value_set_boolean (value, srtobject->authentication);
+      GST_OBJECT_UNLOCK (srtobject->element);
+      break;
     case PROP_AUTO_RECONNECT:
       GST_OBJECT_LOCK (srtobject->element);
       g_value_set_boolean (value, srtobject->auto_reconnect);
@@ -2050,6 +2054,10 @@ get_stats_for_srtsock (GstSRTObject * srtobject, SRTSOCKET srtsock)
       "negotiated-latency-ms", G_TYPE_INT, stats.msSndTsbPdDelay,
       "packets-received", G_TYPE_INT64, stats.pktRecvTotal,
       "packets-received-lost", G_TYPE_INT, stats.pktRcvLossTotal,
+      /* number of retransmitted packets registered at receiver side */
+      "packets-received-retransmitted", G_TYPE_INT, stats.pktRcvRetrans,
+      /* number of dropped packets by the receiver */
+      "packets-received-dropped", G_TYPE_INT, stats.pktRcvDropTotal,
       /* number of sent ACK packets */
       "packet-ack-sent", G_TYPE_INT, stats.pktSentACK,
       /* number of sent NAK packets */

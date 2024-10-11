@@ -107,7 +107,7 @@ struct _GstGLColorConvertClass
                                "xBGR, ARGB, ABGR, GBRA, GBR, RGBP, BGRP, Y444, I420, YV12, Y42B, " \
                                "Y41B, NV12, NV21, NV16, NV61, YUY2, UYVY, Y210, AYUV, " \
                                "VUYA, Y410, A444, A422, GRAY8, GRAY16_LE, GRAY16_BE, " \
-                               "RGB16, BGR16, ARGB64, A420, AV12, NV12_16L32S, NV12_4L4" \
+                               "RGB16, BGR16, ARGB64, A420, AV12, NV12_16L32S, NV12_4L4, RBGA, v210" \
                                GST_GL_COLOR_CONVERT_EXT_FORMATS "}"
 
 /**
@@ -129,7 +129,9 @@ struct _GstGLColorConvertClass
     "width = " GST_VIDEO_SIZE_RANGE ", "                                \
     "height = " GST_VIDEO_SIZE_RANGE ", "                               \
     "framerate = " GST_VIDEO_FPS_RANGE ", "                             \
-    "texture-target = (string) { 2D, rectangle, external-oes }"
+    "texture-target = (string) { 2D, rectangle, external-oes }"         \
+    " ; "                                                               \
+    GST_VIDEO_DMA_DRM_CAPS_MAKE
 
 GST_GL_API
 GstGLColorConvert * gst_gl_color_convert_new (GstGLContext * context);

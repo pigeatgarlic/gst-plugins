@@ -19,9 +19,10 @@ moc_headers = [
 ]
 
 shader_sources = [
-  'vertex.vert',
-  'RGBA.frag',
-  'YUV_TRIPLANAR.frag',
+  { 'glsl': 'vertex.vert' },
+  { 'glsl': 'RGBA.frag', '100es': 'RGBA_gles.frag'},
+  { 'glsl': 'YUV_BIPLANAR.frag' },
+  { 'glsl': 'YUV_TRIPLANAR.frag' },
 ]
 
 qt6qml_dep = dependency('', required: false)
@@ -59,6 +60,13 @@ qt6qml_dep = dependency('qt6', modules : ['Core', 'Gui', 'Qml', 'Quick'],
 if not qt6qml_dep.found()
   subdir_done()
 endif
+
+qt6_bindir = qt6qml_dep.get_variable('bindir', configtool: 'QT_HOST_BINS')
+qsb = find_program('qsb-qt6', 'qsb', dirs: [qt6_bindir], required: qt6_option)
+if not qsb.found()
+  subdir_done()
+endif
+qsb_wrapper = find_program('qsb-wrapper.py')
 
 optional_deps = []
 qt_defines = []
@@ -155,13 +163,13 @@ if host_system == 'ios'
   endif
 endif
 
-if qt6_option.require(have_qt_windowing).allowed()
+if qt6_option.require(have_qt_windowing, error_message: 'No windowing, enable one of the qt-* windowing options').allowed()
   # Build it!
   moc_files = qt6_mod.preprocess(moc_headers : moc_headers, method: qt6_method)
   # TODO: dist backup qsb shaders?
-  qsb = find_program('qsb-qt6', 'qsb')
   shaders = []
-  foreach shader: shader_sources
+  foreach shader_source: shader_sources
+    shader = shader_source['glsl']
     qsb_shader = shader + '.qsb'
     dist_shader = shader + '-dist.qsb'
 
@@ -171,6 +179,18 @@ if qt6_option.require(have_qt_windowing).allowed()
       command: [qsb, '--glsl=100 es,120,330', '--batchable', '--output', '@OUTPUT@', '@INPUT@']
     )
     shaders += [compiled_shader]
+
+    if '100es' in shader_source
+      qsb_shader_external = shader + '.qsb.external'
+
+      compiled_shader_external = custom_target(qsb_shader_external,
+        input: [compiled_shader, shader_source['100es']],
+        output: qsb_shader_external,
+        command: [qsb_wrapper, qsb, '@OUTPUT@', '@INPUT1@', '@INPUT0@'],
+      )
+
+      shaders += [compiled_shader_external]
+    endif
   endforeach
   resource_file = configure_file(input: 'resources.qrc', output: 'resources.qrc', copy: true)
   qresources = qt6_mod.compile_resources(sources: resource_file, method: qt6_method)

@@ -182,7 +182,9 @@ gst_h265_parse_finalize (GObject * object)
 {
   GstH265Parse *h265parse = GST_H265_PARSE (object);
 
-  gst_video_user_data_unregistered_clear (&h265parse->user_data_unregistered);
+  gst_video_clear_user_data_unregistered (&h265parse->user_data_unregistered,
+      TRUE);
+
   g_object_unref (h265parse->frame_out);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -207,6 +209,9 @@ gst_h265_parse_reset_frame (GstH265Parse * h265parse)
   h265parse->have_sps_in_frame = FALSE;
   h265parse->have_pps_in_frame = FALSE;
   gst_adapter_clear (h265parse->frame_out);
+  gst_video_clear_user_data (&h265parse->user_data, FALSE);
+  gst_video_clear_user_data_unregistered (&h265parse->user_data_unregistered,
+      FALSE);
 }
 
 static void
@@ -976,6 +981,15 @@ gst_h265_parse_process_nal (GstH265Parse * h265parse, GstH265NalUnit * nalu)
       }
       break;
     }
+    case GST_H265_NAL_FD:
+      if (!GST_H265_PARSE_STATE_VALID (h265parse, GST_H265_PARSE_STATE_GOT_SPS)) {
+        GST_DEBUG_OBJECT (h265parse, "dropping FD received before SPS");
+        return FALSE;
+      }
+      pres = gst_h265_parser_parse_nal (nalparser, nalu);
+      if (pres != GST_H265_PARSER_OK)
+        return FALSE;
+      break;
     case GST_H265_NAL_AUD:
     default:
       /* Just accumulate AU Delimiter, whether it's before SPS or not */
@@ -1645,25 +1659,25 @@ get_level_string (guint8 level_idc)
     return digit_to_string (level_idc / 30);
   else {
     switch (level_idc) {
-      case 63:
+      case GST_H265_LEVEL_L2_1:
         return "2.1";
         break;
-      case 93:
+      case GST_H265_LEVEL_L3_1:
         return "3.1";
         break;
-      case 123:
+      case GST_H265_LEVEL_L4_1:
         return "4.1";
         break;
-      case 153:
+      case GST_H265_LEVEL_L5_1:
         return "5.1";
         break;
-      case 156:
+      case GST_H265_LEVEL_L5_2:
         return "5.2";
         break;
-      case 183:
+      case GST_H265_LEVEL_L6_1:
         return "6.1";
         break;
-      case 186:
+      case GST_H265_LEVEL_L6_2:
         return "6.2";
         break;
       default:
@@ -3055,8 +3069,7 @@ gst_h265_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
 
     for (i = 0; i < h265parse->time_code.num_clock_ts; i++) {
       gint field_count = -1;
-      guint64 n_frames_tmp;
-      guint n_frames = G_MAXUINT32;
+      guint64 n_frames = G_MAXUINT64;
       GstVideoTimeCodeFlags flags = 0;
       guint64 scale_n, scale_d;
 
@@ -3132,30 +3145,37 @@ gst_h265_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
       scale_n = (guint64) h265parse->parsed_fps_n * vui->num_units_in_tick;
       scale_d = (guint64) h265parse->parsed_fps_d * vui->time_scale;
 
-      n_frames_tmp =
-          gst_util_uint64_scale_int (h265parse->time_code.n_frames[i], scale_n,
-          scale_d);
-      if (n_frames_tmp <= G_MAXUINT32) {
-        if (h265parse->time_code.units_field_based_flag[i])
-          n_frames_tmp *= 2;
+      if (h265parse->time_code.units_field_based_flag[i])
+        scale_n *= 2;
 
-        if (n_frames_tmp <= G_MAXUINT32)
-          n_frames = (guint) n_frames_tmp;
-      }
+      n_frames = gst_util_uint64_scale (h265parse->time_code.n_frames[i],
+          scale_n, scale_d);
 
-      if (n_frames != G_MAXUINT32) {
+      if (n_frames <= G_MAXUINT32) {
+        GST_LOG_OBJECT (h265parse,
+            "Add time code meta %02u:%02u:%02u:%02u",
+            h265parse->time_code.hours_flag[i] ?
+            h265parse->time_code.hours_value[i] : 0,
+            h265parse->time_code.minutes_flag[i] ?
+            h265parse->time_code.minutes_value[i] : 0,
+            h265parse->time_code.seconds_flag[i] ?
+            h265parse->time_code.seconds_value[i] : 0, (guint) n_frames);
+
         gst_buffer_add_video_time_code_meta_full (parse_buffer,
             h265parse->parsed_fps_n,
             h265parse->parsed_fps_d,
             NULL,
             flags,
-            h265parse->time_code.hours_flag[i] ? h265parse->time_code.
-            hours_value[i] : 0,
-            h265parse->time_code.minutes_flag[i] ? h265parse->time_code.
-            minutes_value[i] : 0,
-            h265parse->time_code.seconds_flag[i] ? h265parse->time_code.
-            seconds_value[i] : 0, n_frames, field_count);
-      }
+            h265parse->time_code.hours_flag[i] ?
+            h265parse->time_code.hours_value[i] : 0,
+            h265parse->time_code.minutes_flag[i] ?
+            h265parse->time_code.minutes_value[i] : 0,
+            h265parse->time_code.seconds_flag[i] ?
+            h265parse->time_code.seconds_value[i] : 0,
+            (guint) n_frames, field_count);
+      } else
+        GST_WARNING_OBJECT (h265parse,
+            "Skipping time code meta, n_frames calculation failed");
     }
   }
 

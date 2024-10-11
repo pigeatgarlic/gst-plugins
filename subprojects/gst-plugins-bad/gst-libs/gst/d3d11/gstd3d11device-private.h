@@ -21,6 +21,7 @@
 
 #include <gst/gst.h>
 #include <gst/d3d11/gstd3d11_fwd.h>
+#include <gst/d3dshader/gstd3dshader.h>
 
 G_BEGIN_DECLS
 
@@ -31,25 +32,43 @@ GST_D3D11_API
 gint64  gst_d3d11_vertex_shader_token_new (void);
 
 GST_D3D11_API
+gint64  gst_d3d11_compute_shader_token_new (void);
+
+GST_D3D11_API
 HRESULT gst_d3d11_device_get_pixel_shader  (GstD3D11Device * device,
                                             gint64 token,
-                                            const void * bytecode,
-                                            gsize bytecode_size,
-                                            const gchar * source,
                                             const gchar * entry_point,
+                                            const GstD3DShaderByteCode * bytecode,
                                             ID3D11PixelShader ** ps);
 
 GST_D3D11_API
 HRESULT gst_d3d11_device_get_vertex_shader (GstD3D11Device * device,
                                             gint64 token,
-                                            const void * bytecode,
-                                            gsize bytecode_size,
-                                            const gchar * source,
                                             const gchar * entry_point,
+                                            const GstD3DShaderByteCode * bytecode,
                                             const D3D11_INPUT_ELEMENT_DESC * input_desc,
                                             guint desc_len,
                                             ID3D11VertexShader ** vs,
                                             ID3D11InputLayout ** layout);
+
+GST_D3D11_API
+HRESULT gst_d3d11_device_get_sampler       (GstD3D11Device * device,
+                                            D3D11_FILTER filter,
+                                            ID3D11SamplerState ** sampler);
+
+GST_D3D11_API
+HRESULT gst_d3d11_device_get_rasterizer    (GstD3D11Device * device,
+                                            ID3D11RasterizerState ** rasterizer);
+
+GST_D3D11_API
+HRESULT gst_d3d11_device_get_rasterizer_msaa (GstD3D11Device * device,
+                                              ID3D11RasterizerState ** rasterizer);
+
+GST_D3D11_API
+void    gst_d3d11_device_check_device_removed (GstD3D11Device * device);
+
+GST_D3D11_API
+gboolean gst_d3d11_device_d3d12_import_supported (GstD3D11Device * device);
 
 G_END_DECLS
 
